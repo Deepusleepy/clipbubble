@@ -249,6 +249,105 @@ static class Program
             Check(!Mascots.Remove("cat"), "built-ins stay");
         }),
 
+        ("removing a mascot never deletes files another mascot owns", () =>
+        {
+            Mascots.Add("Victim", "blob", "#FF6AD5", new());
+            Mascots.Add("Sneaky", "emoji", null, new() { ["idle"] = "victim.json" });
+            Check(Mascots.Remove("sneaky"), "removed");
+            Check(File.Exists(Path.Combine(Mascots.Dir, "victim.json")), "victim.json survives");
+        }),
+
+        ("a hidden category can't be fetched by id either", () =>
+        {
+            long id;
+            using (var db = new Db())
+            {
+                db.Upsert(ClipKind.Text, "private note", null, "Notepad", "t:private");
+                id = db.Clips().Single().Id;
+            }
+            Prefs.SetOn("text", false);
+            using var db2 = new Db();
+            Check(db2.Clip(id) == null, "hidden from lookup by id");
+            Prefs.SetOn("text", true);
+            Check(db2.Clip(id)?.Text == "private note", "visible again when switched back on");
+        }),
+
+        ("a screenshot saved into a folder that didn't exist yet is still caught", () =>
+        {
+            var folder = Path.Combine(Paths.Dir, "later-" + Guid.NewGuid().ToString("N").Substring(0, 6));
+            var seen = new List<string>();
+            using var watcher = new FolderWatcher(folder, 120, _ => true, (path, _) => seen.Add(path));
+            Directory.CreateDirectory(folder);
+            var shot = Path.Combine(folder, "Screenshot 1.png");
+            File.WriteAllBytes(shot, TinyPng());
+            Snapshots.Pump(6);   // the watcher re-checks for a missing folder every 5 s
+            Check(seen.Contains(shot), "first screenshot reported: " + string.Join(",", seen));
+        }),
+
+        ("showing a thumbnail never leaves the user's file locked", () =>
+        {
+            var shot = Path.Combine(Paths.Dir, "locked-" + Guid.NewGuid().ToString("N").Substring(0, 6) + ".png");
+            File.WriteAllBytes(shot, TinyPng());
+            BitmapSource? thumb = null;
+            Thumbs.Load(shot, 64, b => thumb = b);
+            Snapshots.Pump(1);
+            Check(thumb != null && Thumbs.SizeOf(shot) is { Width: 4 }, "thumbnail and size loaded");
+            File.Delete(shot);
+            Check(!File.Exists(shot), "file could be deleted right away");
+        }),
+
+        ("a big animated GIF mascot is decoded at the size it's shown", () =>
+        {
+            var gif = Path.Combine(Paths.Dir, "big.gif");
+            var enc = new GifBitmapEncoder();
+            foreach (var shade in new byte[] { 40, 160 })
+            {
+                var px = new byte[480 * 480 * 4];
+                for (var i = 0; i < px.Length; i += 4) { px[i] = shade; px[i + 1] = 90; px[i + 2] = 200; px[i + 3] = 255; }
+                enc.Frames.Add(BitmapFrame.Create(BitmapSource.Create(480, 480, 96, 96, PixelFormats.Bgra32, null, px, 480 * 4)));
+            }
+            using (var f = File.Create(gif)) enc.Save(f);
+            var image = new System.Windows.Controls.Image();
+            Check(GifPlayer.Create(gif, image) != null, "decoded");
+            var first = (BitmapSource)image.Source;
+            Check(first.PixelWidth <= 102 && first.PixelHeight <= 102, $"frame is {first.PixelWidth}x{first.PixelHeight}; expected at most 102 px, not the GIF's full 480");
+        }),
+
+        ("MCP times read the same in every region", () =>
+        {
+            using (var db = new Db()) db.Upsert(ClipKind.Text, "hello", null, "Notepad", "t:hello");
+            var culture = System.Threading.Thread.CurrentThread.CurrentCulture;
+            System.Threading.Thread.CurrentThread.CurrentCulture = new System.Globalization.CultureInfo("fi-FI");   // writes times as 14.30
+            try
+            {
+                using var db = new Db();
+                var text = (string)((Dictionary<string, object>)((object[])ClipBubble.Mcp.Call(db, "clipboard_history", new Dictionary<string, object?>())["content"])[0])["text"];
+                Check(System.Text.RegularExpressions.Regex.IsMatch(text, @"\d{4}-\d{2}-\d{2} \d{2}:\d{2}"), text);
+            }
+            finally { System.Threading.Thread.CurrentThread.CurrentCulture = culture; }
+        }),
+
+        ("a screenshot that's both copied and saved shows up once, in either order", () =>
+        {
+            var shot = Path.Combine(Paths.Dir, "Screenshot 1.png");
+            File.WriteAllBytes(shot, TinyPng(3));
+            var reencoded = Reencode(TinyPng(3));
+            using var db = new Db();
+            db.InsertIfMissing(ClipKind.File, shot, "Screenshot", "f:" + Store.Sha(shot), DateTime.Now);
+            Check(!new Recorder().Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now), "copy after the file is skipped");
+            Check(db.Clips().Count == 1, "file first: one row");
+
+            db.DeleteAll();
+            new Recorder().Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now);
+            db.InsertIfMissing(ClipKind.File, shot, "Screenshot", "f:" + Store.Sha(shot), DateTime.Now);
+            db.DropCopiesOf(shot);
+            Check(db.Clips().Single().Source == "Screenshot", "copy first: the file's row replaces it");
+
+            new Recorder().Record(new Snapshot(Array.Empty<string>(), null, TinyPng(5), null), "Paint", DateTime.Now);
+            db.DropCopiesOf(shot);
+            Check(db.Clips().Count == 2, "a different picture copied at the same time stays");
+        }),
+
         ("mascot validation matches the Mac messages", () =>
         {
             string Err(Action a) { try { a(); return ""; } catch (MascotException e) { return e.Message; } }
@@ -308,6 +407,8 @@ static class Program
         try
         {
             stdin.WriteLine("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+            stdin.WriteLine("[1,2]");
+            stdin.WriteLine("\"not an object\"");
             var init = Call("initialize", new { protocolVersion = "2025-06-18" });
             Check((string)((Dictionary<string, object>)init["serverInfo"])["name"] == "clipbubble", "server name");
             var tools = List(Call("tools/list")["tools"]).Select(t => (string)((Dictionary<string, object>)t)["name"]).ToArray();
@@ -322,6 +423,9 @@ static class Program
             Check(Tool("mascot_list", new { }).Contains("pixel-fox · Pixel Fox · image · custom  ← active"), "mascot_list");
             Check(Tool("mascot_remove", new { id = "pixel-fox" }) == "Removed mascot pixel-fox.", "mascot_remove");
             Check(Tool("clipboard_get", new { id = 999999 }) == "No item with that id.", "missing id");
+            stdin.WriteLine("{\"jsonrpc\":\"2.0\",\"id\":" + (++id) + ",\"method\":\"tools/call\",\"params\":{\"name\":\"clipboard_get\",\"arguments\":{\"id\":9223372036854775808}}}");
+            var huge = p.StandardOutput.ReadLine() ?? throw new Exception("server died on an out-of-range id");
+            Check(huge.Contains("No item with that id."), "out-of-range id is just a missing item: " + huge);
             Sql.Exec(Paths.Db, "ALTER TABLE clips RENAME TO gone");
             stdin.WriteLine(json.Serialize(new Dictionary<string, object?> { ["jsonrpc"] = "2.0", ["id"] = ++id, ["method"] = "tools/call", ["params"] = new { name = "clipboard_history", arguments = new { } } }));
             var failed = json.Deserialize<Dictionary<string, object>>(p.StandardOutput.ReadLine() ?? throw new Exception("server died on a failing request"));
@@ -339,6 +443,16 @@ static class Program
     public const string Svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\"><rect x=\"2\" y=\"5\" width=\"12\" height=\"7\" fill=\"#E8762B\"/><rect x=\"5\" y=\"7\" width=\"2\" height=\"2\" fill=\"#222\"/></svg>";
 
     static Snapshot Text(string s) => new(Array.Empty<string>(), s, null, null);
+
+    /// Same pixels, different PNG bytes, like a screenshot tool's copy versus its saved file.
+    static byte[] Reencode(byte[] png)
+    {
+        var enc = new PngBitmapEncoder { Interlace = PngInterlaceOption.On };
+        enc.Frames.Add(BitmapFrame.Create(new MemoryStream(png)));
+        using var ms = new MemoryStream();
+        enc.Save(ms);
+        return ms.ToArray();
+    }
 
     static string Squash(string s) => string.Join(" ", s.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).Replace("( ", "(").Replace(" )", ")");
 
@@ -500,7 +614,7 @@ static class Snapshots
         return glass;
     }
 
-    static void Pump(double seconds)
+    public static void Pump(double seconds)
     {
         var frame = new DispatcherFrame();
         var t = new DispatcherTimer { Interval = TimeSpan.FromSeconds(seconds) };

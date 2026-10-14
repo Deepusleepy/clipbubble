@@ -64,7 +64,7 @@ sealed class Capture : IDisposable
         if (seen == handled) return;
         IDataObject? data;
         try { data = Clipboard.GetDataObject(); }
-        catch (COMException) when (busyRetries++ < 5) { settle.Start(); return; }   // another app has it open
+        catch (COMException) when (busyRetries++ < 2) { settle.Start(); return; }   // another app has it open (each try waits ~1 s)
         catch (COMException) { handled = seen; return; }
         handled = seen;
         if (data == null || Read(data) is not { } snapshot) return;
@@ -132,6 +132,8 @@ sealed class Recorder
             return true;
         }
 
+        if (clip.Png is { } shot && db.IsRecentScreenshot(shot)) return false;   // its saved file is already in history
+
         var inserted = !db.Exists(clip.Hash);
         if (clip.Png is { } png)
         {
@@ -192,7 +194,7 @@ sealed class Recorder
 /// Names and icons of the apps things were copied from.
 static class Apps
 {
-    static readonly int OwnPid = Process.GetCurrentProcess().Id;
+    static readonly string OwnExe = Process.GetCurrentProcess().MainModule!.FileName;
     static readonly string File = Path.Combine(Paths.Dir, "apps.json");
     /// Remembered across launches so rows keep their app icons after a restart.
     static readonly Dictionary<string, string> PathsByName = Load();
@@ -203,12 +205,13 @@ static class Apps
         catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return new(); }
     }
 
-    /// The app that owns the clipboard right now, or null when it's ClipBubble itself (picking a clip keeps its source).
+    /// The app that owns the clipboard right now, or null when it's ClipBubble itself, including its MCP server
+    /// (picking a clip or clipboard_set keeps the clip's source).
     public static string? ClipboardOwner()
     {
         var owner = GetClipboardOwner();
-        GetWindowThreadProcessId(owner != IntPtr.Zero ? owner : GetForegroundWindow(), out var pid);
-        if (pid == OwnPid) return null;
+        Win.GetWindowThreadProcessId(owner != IntPtr.Zero ? owner : Win.GetForegroundWindow(), out var pid);
+        if (ExePath((int)pid) is { } exe && string.Equals(exe, OwnExe, StringComparison.OrdinalIgnoreCase)) return null;
         return Name((int)pid) ?? "Windows";
     }
 
@@ -234,7 +237,7 @@ static class Apps
 
     static string? ExePath(int pid)
     {
-        var h = OpenProcess(0x1000, false, pid);   // PROCESS_QUERY_LIMITED_INFORMATION
+        var h = Win.OpenProcess(0x1000, false, pid);   // PROCESS_QUERY_LIMITED_INFORMATION
         if (h == IntPtr.Zero) return null;
         try
         {
@@ -242,14 +245,10 @@ static class Apps
             var size = sb.Capacity;
             return QueryFullProcessImageName(h, 0, sb, ref size) ? sb.ToString() : null;
         }
-        finally { CloseHandle(h); }
+        finally { Win.CloseHandle(h); }
     }
 
     [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
-    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
-    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder name, ref int size);
 }
 
@@ -282,6 +281,7 @@ sealed class FolderWatcher : IDisposable
     readonly DispatcherTimer retry = new() { Interval = TimeSpan.FromSeconds(5) };
     HashSet<string> known = new();
     FileSystemWatcher? watcher;
+    bool stopped;
 
     /// `maxAge` ignores files older than that (so moving old screenshots in doesn't count); null takes everything new.
     public FolderWatcher(string folder, double? maxAge, Func<string, bool> include, Action<string, DateTime> onNew)
@@ -292,23 +292,27 @@ sealed class FolderWatcher : IDisposable
         this.onNew = onNew;
         debounce.Tick += (_, _) => { debounce.Stop(); Scan(); };
         retry.Tick += (_, _) => Start();
+        if (Directory.Exists(folder)) known = new HashSet<string>(Listing());
         Start();
     }
 
     public void Dispose()
     {
+        stopped = true;
         retry.Stop();
         debounce.Stop();
         watcher?.Dispose();
         watcher = null;
     }
 
-    /// Retries until the folder exists (Snipping Tool creates Screenshots on the first save).
+    /// Retries until the folder exists (Snipping Tool creates Screenshots on the first save). Each (re)start ends with
+    /// a scan against what was known before, so files that arrived while the folder was missing or the watcher was
+    /// down still count as new.
     void Start()
     {
         retry.Stop();
+        if (stopped) return;
         if (!Directory.Exists(Folder)) { retry.Start(); return; }
-        known = new HashSet<string>(Listing());
         var dispatcher = Dispatcher.CurrentDispatcher;
         watcher = new FileSystemWatcher(Folder) { NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName, IncludeSubdirectories = false };
         FileSystemEventHandler changed = (_, _) => dispatcher.BeginInvoke(new Action(() => { debounce.Stop(); debounce.Start(); }));
@@ -316,6 +320,7 @@ sealed class FolderWatcher : IDisposable
         watcher.Renamed += (s, e) => changed(s, e);
         watcher.Error += (_, _) => dispatcher.BeginInvoke(new Action(() => { watcher?.Dispose(); watcher = null; Start(); }));
         watcher.EnableRaisingEvents = true;
+        Scan();
     }
 
     public static DateTime Added(string path)
@@ -344,6 +349,7 @@ sealed class FolderWatcher : IDisposable
 
     void Scan()
     {
+        if (stopped) return;
         var now = Listing().ToList();
         var fresh = now.Where(p => !known.Contains(p)).ToList();
         known = new HashSet<string>(now);

@@ -26,25 +26,28 @@ namespace ClipBubble;
 // MARK: - Model
 
 /// The app's state. Views subscribe to `Changed` and redraw the part named in it, like a SwiftUI ObservableObject.
+/// What changed in the model, so views redraw only the part they show.
+enum Change { Clips, Recent, Query, Filter, Selection, Previewing, ShowSettings, Unseen, Mascot, Prefs, Shown }
+
 sealed class Model
 {
     public static readonly (string Tag, string Title)[] Filters =
         { ("all", "All"), ("text", "Text"), ("image", "Images"), ("file", "Files"), ("shots", "Screenshots"), ("downloads", "Downloads") };
 
-    public event Action<string>? Changed;
-    void Raise(string what) => Changed?.Invoke(what);
+    public event Action<Change>? Changed;
+    void Raise(Change what) => Changed?.Invoke(what);
 
     public List<Clip> Clips { get; private set; } = new();
     public List<Clip> Recent { get; private set; } = new();
     string query = "", filter = "all";
-    public string Query { get => query; set { if (value == query) return; query = value; Raise(nameof(Query)); Reload(); } }
-    public string Filter { get => filter; set { if (value == filter) return; filter = value; Raise(nameof(Filter)); Reload(); } }
+    public string Query { get => query; set { if (value == query) return; query = value; Raise(Change.Query); Reload(); } }
+    public string Filter { get => filter; set { if (value == filter) return; filter = value; Raise(Change.Filter); Reload(); } }
     long? selection;
-    public long? Selection { get => selection; set { selection = value; Raise(nameof(Selection)); } }
+    public long? Selection { get => selection; set { selection = value; Raise(Change.Selection); } }
     bool previewing, showSettings;
-    public bool Previewing { get => previewing; set { previewing = value; Raise(nameof(Previewing)); } }
-    public bool ShowSettings { get => showSettings; set { showSettings = value; Raise(nameof(ShowSettings)); } }
-    public int Unseen { get => unseen; set { unseen = value; Raise(nameof(Unseen)); } }
+    public bool Previewing { get => previewing; set { previewing = value; Raise(Change.Previewing); } }
+    public bool ShowSettings { get => showSettings; set { showSettings = value; Raise(Change.ShowSettings); } }
+    public int Unseen { get => unseen; set { unseen = value; Raise(Change.Unseen); } }
     int unseen;
     public Mascot Mascot { get; private set; } = Mascots.Active();
     public List<Mascot> AllMascots { get; private set; } = Mascots.All();
@@ -53,9 +56,21 @@ sealed class Model
     public Action<Clip, bool> Pick = (_, _) => { };
     public Action PrefsChanged = () => { };
     /// Bumps on every open: refocuses search and refreshes relative times.
-    public void Shown() => Raise(nameof(Shown));
+    public void Shown() => Raise(Change.Shown);
 
     public Clip? Selected => Clips.FirstOrDefault(c => c.Id == Selection) ?? Clips.FirstOrDefault();
+
+    /// Fresh state for a panel opening: no search, All, first item selected, with a single query.
+    public void Reset()
+    {
+        (query, filter) = ("", "all");
+        Raise(Change.Query);
+        Raise(Change.Filter);
+        Previewing = false;
+        ShowSettings = false;
+        Reload();
+        Selection = Clips.FirstOrDefault()?.Id;
+    }
 
     public void Reload()
     {
@@ -64,14 +79,14 @@ sealed class Model
         Clips = Db.Clips(kind: kind, source: source, query: Query);
         if (!Clips.Any(c => c.Id == Selection)) selection = Clips.FirstOrDefault()?.Id;
         Thumbs.Prewarm(Clips.Take(40));
-        Raise(nameof(Clips));
+        Raise(Change.Clips);
     }
 
     public void ReloadRecent()
     {
         Recent = Db.Clips(limit: 3);
         Thumbs.Prewarm(Recent);
-        Raise(nameof(Recent));
+        Raise(Change.Recent);
     }
 
     public void SetPref(string key, bool on)
@@ -80,7 +95,7 @@ sealed class Model
         Reload();
         ReloadRecent();
         PrefsChanged();
-        Raise("Prefs");
+        Raise(Change.Prefs);
     }
 
     public void LoadMascots()
@@ -88,7 +103,7 @@ sealed class Model
         Glyphs.ClearCache();
         AllMascots = Mascots.All();
         Mascot = Mascots.Active();
-        Raise(nameof(Mascot));
+        Raise(Change.Mascot);
     }
 
     public void Move(int delta)
@@ -110,7 +125,7 @@ sealed class Model
         Db.Delete(c.Id);
         Clips.RemoveAll(x => x.Id == c.Id);
         if (Selection == c.Id) selection = Clips.Count == 0 ? null : Clips[Math.Min(i, Clips.Count - 1)].Id;
-        Raise(nameof(Clips));
+        Raise(Change.Clips);
         ReloadRecent();
     }
 }
@@ -137,11 +152,14 @@ static class Thumbs
             Size? dims = null;
             try
             {
-                var frame = BitmapDecoder.Create(new Uri(path), BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.None).Frames[0];
+                // Read through a shared stream that's closed right after, so the user's file is never left locked.
+                using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var frame = BitmapDecoder.Create(file, BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.None).Frames[0];
                 dims = new Size(frame.PixelWidth, frame.PixelHeight);
+                file.Position = 0;
                 var bi = new BitmapImage();
                 bi.BeginInit();
-                bi.UriSource = new Uri(path);
+                bi.StreamSource = file;
                 bi.CacheOption = BitmapCacheOption.OnLoad;
                 bi.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
                 if (frame.PixelWidth >= frame.PixelHeight) bi.DecodePixelWidth = Math.Min(px, frame.PixelWidth);
@@ -153,7 +171,7 @@ static class Thumbs
             catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException or InvalidOperationException) { }
             dispatcher.BeginInvoke(new Action(() =>
             {
-                Cache[Key(path, px)] = img;
+                if (px <= 64) Cache[Key(path, px)] = img;   // row thumbnails only; full-size previews would pile up
                 if (dims is { } d) Dims[path] = d;
                 done(img);
             }));
@@ -281,13 +299,7 @@ static class UI
     public static readonly IEasingFunction Cubic = new CubicEase { EasingMode = EasingMode.EaseInOut };
 
     /// SwiftUI's `.spring(response:dampingFraction:)`, run for as long as the spring takes to settle.
-    public static void Spring(Animatable target, DependencyProperty prop, double to, double response, double damping)
-    {
-        var ease = new SpringEase(response, damping);
-        target.BeginAnimation(prop, new DoubleAnimation(to, new Duration(TimeSpan.FromSeconds(ease.Settle))) { EasingFunction = ease });
-    }
-
-    public static void Spring(UIElement target, DependencyProperty prop, double to, double response, double damping)
+    public static void Spring(IAnimatable target, DependencyProperty prop, double to, double response, double damping)
     {
         var ease = new SpringEase(response, damping);
         target.BeginAnimation(prop, new DoubleAnimation(to, new Duration(TimeSpan.FromSeconds(ease.Settle))) { EasingFunction = ease });
@@ -309,12 +321,18 @@ static class UI
         return anim;
     }
 
-    public static BitmapSource? ShellIcon(string path, int px) => Shell.Icon(path, px);
-
-    /// A dark menu like macOS's: rounded, translucent-looking, accent highlight on the hovered item.
+    /// A dark menu like macOS's: rounded, accent highlight on the hovered item.
     public static ContextMenu Menu()
     {
-        var menu = new ContextMenu { HasDropShadow = true };
+        var menu = new ContextMenu { HasDropShadow = true, Template = MenuLook.Value.Frame };
+        menu.Resources[typeof(MenuItem)] = MenuLook.Value.Item;
+        menu.Resources[typeof(Separator)] = MenuLook.Value.Separator;
+        return menu;
+    }
+
+    /// Built once and shared by every row's menu.
+    static readonly Lazy<(ControlTemplate Frame, Style Item, Style Separator)> MenuLook = new(() =>
+    {
         var frame = new FrameworkElementFactory(typeof(Border));
         frame.SetValue(Border.BackgroundProperty, new SolidColorBrush(Color.FromRgb(0x2B, 0x2A, 0x28)));
         frame.SetValue(Border.BorderBrushProperty, White(0.12));
@@ -323,7 +341,7 @@ static class UI
         frame.SetValue(Border.PaddingProperty, new Thickness(5));
         var items = new FrameworkElementFactory(typeof(ItemsPresenter));
         frame.AppendChild(items);
-        menu.Template = new ControlTemplate(typeof(ContextMenu)) { VisualTree = frame };
+        var frameTemplate = new ControlTemplate(typeof(ContextMenu)) { VisualTree = frame };
 
         var row = new FrameworkElementFactory(typeof(Border), "row");
         row.SetValue(Border.CornerRadiusProperty, new CornerRadius(4));
@@ -339,7 +357,6 @@ static class UI
         item.Setters.Add(new Setter(TextElement.FontFamilyProperty, Text));
         item.Setters.Add(new Setter(TextElement.FontSizeProperty, 13.0));
         item.Setters.Add(new Setter(TextElement.ForegroundProperty, Primary));
-        menu.Resources[typeof(MenuItem)] = item;
 
         var line = new FrameworkElementFactory(typeof(Border));
         line.SetValue(FrameworkElement.HeightProperty, 1.0);
@@ -347,9 +364,11 @@ static class UI
         line.SetValue(Border.BackgroundProperty, White(0.12));
         var separator = new Style(typeof(Separator));
         separator.Setters.Add(new Setter(Control.TemplateProperty, new ControlTemplate(typeof(Separator)) { VisualTree = line }));
-        menu.Resources[typeof(Separator)] = separator;
-        return menu;
-    }
+        frameTemplate.Seal();
+        item.Seal();
+        separator.Seal();
+        return (frameTemplate, item, separator);
+    });
 }
 
 /// A damped spring with SwiftUI's parameters: `response` is the period, `damping` the damping fraction.
@@ -425,11 +444,13 @@ static unsafe class Shell
     /// The Windows folder picker (NSOpenPanel with canChooseDirectories). Returns null if cancelled.
     public static string? PickFolder(IntPtr owner, string start, string title)
     {
-        if (CoCreateInstance(new Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7"), IntPtr.Zero, 1, new Guid("d57c7288-d4ad-4768-be02-9d969532d960"), out var dlg) < 0) return null;
+        if (Glyphs.CoCreateInstance(new Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7"), IntPtr.Zero, 1, new Guid("d57c7288-d4ad-4768-be02-9d969532d960"), out var dlg) < 0) return null;
         try
         {
             var vt = *(IntPtr**)dlg;
-            ((delegate* unmanaged[Stdcall]<IntPtr, uint, int>)vt[9])(dlg, 0x20 | 0x40);   // SetOptions: FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM
+            uint options;
+            ((delegate* unmanaged[Stdcall]<IntPtr, uint*, int>)vt[10])(dlg, &options);   // GetOptions
+            ((delegate* unmanaged[Stdcall]<IntPtr, uint, int>)vt[9])(dlg, options | 0x20 | 0x40);   // SetOptions: + FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM
             fixed (char* t = title) ((delegate* unmanaged[Stdcall]<IntPtr, char*, int>)vt[17])(dlg, t);   // SetTitle
             if (Directory.Exists(start) && SHCreateItemFromParsingName(start, IntPtr.Zero, new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), out var folder) >= 0)
             {
@@ -451,7 +472,6 @@ static unsafe class Shell
         finally { Marshal.Release(dlg); }
     }
 
-    [DllImport("ole32.dll")] static extern int CoCreateInstance(in Guid clsid, IntPtr outer, int ctx, in Guid riid, out IntPtr obj);
 }
 
 // MARK: - Windows
@@ -551,14 +571,14 @@ static class Win
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
     [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(int access, bool inherit, int pid);
     [DllImport("advapi32.dll")] static extern bool OpenProcessToken(IntPtr process, int access, out IntPtr token);
     [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr buffer, int size, out int needed);
     [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
     [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid, int index);
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
-    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
 }
 
 /// A borderless always-on-top window. Bubble and peek never take focus; the panel does, because it has a search field.
@@ -655,8 +675,8 @@ sealed class BubbleView : Grid
         Children.Add(HitArea);
         model.Changed += what =>
         {
-            if (what == nameof(Model.Unseen)) UpdateBadge();
-            if (what == nameof(Model.Mascot)) ReplaceMascot();
+            if (what == Change.Unseen) UpdateBadge();
+            if (what == Change.Mascot) ReplaceMascot();
         };
     }
 
@@ -794,7 +814,7 @@ sealed class Row : Border
 
         // Panel rows follow the keyboard selection; peek rows (index -1) are never selected.
         if (index < 0) return;
-        Action<string> follow = what => { if (what == nameof(Model.Selection)) Selected = clip.Id == model.Selection; };
+        Action<Change> follow = what => { if (what == Change.Selection) Selected = clip.Id == model.Selection; };
         Loaded += (_, _) => model.Changed += follow;
         Unloaded += (_, _) => model.Changed -= follow;
     }
@@ -827,7 +847,7 @@ sealed class Row : Border
     {
         "Screenshot" => UI.Icon(UI.Camera, 9.5),
         "Downloads" => UI.Icon(UI.Download, 9.5),
-        _ => Apps.ExePath(clip.Source) is { } exe && UI.ShellIcon(exe, 32) is { } img ? new Image { Source = img, Width = 12, Height = 12, VerticalAlignment = VerticalAlignment.Center } : null,
+        _ => Apps.ExePath(clip.Source) is { } exe && Shell.Icon(exe, 32) is { } img ? new Image { Source = img, Width = 12, Height = 12, VerticalAlignment = VerticalAlignment.Center } : null,
     };
 
     string FirstLine => clip.Text.Split('\n', '\r').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim() ?? "";
@@ -887,7 +907,7 @@ sealed class Tile : Border
         else if (clip.Paths.FirstOrDefault() is { } p)
         {
             BorderThickness = new Thickness(0);
-            Child = new Image { Source = UI.ShellIcon(p, 64), Margin = new Thickness(2) };
+            Child = new Image { Source = Shell.Icon(p, 64), Margin = new Thickness(2) };
         }
         else if (UI.HexColor(clip.Text) is { } c) Background = new SolidColorBrush(c);
         else if (UI.IsUrl(clip.Text)) Symbol(UI.Link, Color.FromRgb(0x0A, 0x84, 0xFF), angle: -45);   // SF Symbols' link is diagonal
@@ -985,19 +1005,19 @@ sealed class PanelView : Grid
         {
             switch (what)
             {
-                case nameof(Model.Clips): RenderRows(); break;
-                case nameof(Model.Selection): Select(); break;
-                case nameof(Model.Filter): RenderFilters(); break;
-                case nameof(Model.Query):
+                case Change.Clips: RenderRows(); break;
+                case Change.Selection: Select(); break;
+                case Change.Filter: RenderFilters(); break;
+                case Change.Query:
                     if (search.Text != model.Query) search.Text = model.Query;
                     clear.Visibility = model.Query.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
                     break;
-                case nameof(Model.Previewing): ShowPreview(); break;
-                case nameof(Model.ShowSettings):
+                case Change.Previewing: ShowPreview(); break;
+                case Change.ShowSettings:
                     if (model.ShowSettings) { settings = makeSettings(); Children.Add(settings); main.Visibility = Visibility.Hidden; }
                     else { if (settings != null) Children.Remove(settings); settings = null; main.Visibility = Visibility.Visible; search.Focus(); }
                     break;
-                case nameof(Model.Shown): Opened(); break;
+                case Change.Shown: Opened(); break;
             }
         };
         RenderFilters();
@@ -1128,7 +1148,7 @@ sealed class PreviewPane : Border
         else if (clip.Paths.Length > 0)
         {
             var stack = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(20) };
-            stack.Children.Add(new Image { Source = UI.ShellIcon(clip.Paths[0], 128), Width = 64, Height = 64 });
+            stack.Children.Add(new Image { Source = Shell.Icon(clip.Paths[0], 128), Width = 64, Height = 64 });
             stack.Children.Add(new TextBox
             {
                 Text = string.Join("\n", clip.Paths), IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
@@ -1163,7 +1183,7 @@ sealed class PeekView : StackPanel
         this.hotkey = hotkey;
         Width = 288;   // 300 with the padding, like SwiftUI's .padding(6).frame(width: 300)
         Margin = new Thickness(6);
-        model.Changed += what => { if (what is nameof(Model.Recent) or nameof(Model.Shown)) Render(); };
+        model.Changed += what => { if (what is Change.Recent or Change.Shown) Render(); };
         Render();
     }
 
@@ -1227,15 +1247,23 @@ sealed class SettingsView : Grid
         Children.Add(scroll);
 
         Render();
-        ticker.Tick += (_, _) => Render();
-        Loaded += (_, _) => ticker.Start();
-        Unloaded += (_, _) => ticker.Stop();
-        model.Changed += what => { if (what is "Prefs" or nameof(Model.Mascot)) Render(); };
+        // Like the Mac's 2 s refresh: notices folders appearing or becoming readable, without rebuilding
+        // (and so interrupting) the controls when nothing changed.
+        ticker.Tick += (_, _) => { if (FolderStatus() != shownStatus) Render(); };
+        Action<Change> changed = what => { if (what is Change.Prefs or Change.Mascot) Render(); };
+        Loaded += (_, _) => { ticker.Start(); model.Changed += changed; };
+        Unloaded += (_, _) => { ticker.Stop(); model.Changed -= changed; };
     }
 
-    /// Rebuilt whole (it's small): picks up folder changes made outside the app, like the Mac's 2 s refresh.
+    string shownStatus = "";
+
+    static string FolderStatus() =>
+        $"{FolderWatcher.ScreenshotFolder}|{FolderWatcher.CanRead(FolderWatcher.ScreenshotFolder)}|{FolderWatcher.CanRead(FolderWatcher.DownloadsFolder)}";
+
+    /// Rebuilt whole (it's small) when something it shows changes.
     void Render()
     {
+        shownStatus = FolderStatus();
         content.Children.Clear();
 
         var save = Section("Save to history");
@@ -1458,19 +1486,24 @@ sealed class SettingsView : Grid
     /// Click, then press the new shortcut. Esc cancels.
     FrameworkElement HotkeyBox()
     {
-        var label = UI.Label(app.HotkeyText, 11, UI.Primary, FontWeights.Medium);
+        var label = UI.Label(app.HotkeyLabel, 11, UI.Primary, FontWeights.Medium);
         var box = new Border { CornerRadius = new CornerRadius(5), Background = UI.White(0.09), Padding = new Thickness(8, 2, 8, 3), Child = label, Focusable = true, Cursor = Cursors.Arrow, FocusVisualStyle = null };
-        box.MouseLeftButtonUp += (_, _) => { label.Text = "Press keys…"; box.Focus(); };
+        var recording = false;
+        void Stop(string text) { recording = false; app.PauseHotkey(false); label.Text = text; }
+        // The current shortcut is switched off while recording, so pressing it again records it instead of closing the panel.
+        box.MouseLeftButtonUp += (_, _) => { recording = true; app.PauseHotkey(true); label.Text = "Press keys…"; box.Focus(); };
+        box.LostKeyboardFocus += (_, _) => { if (recording) Stop(app.HotkeyLabel); };
         box.PreviewKeyDown += (_, e) =>
         {
-            if (label.Text != "Press keys…") return;
+            if (!recording) return;
             e.Handled = true;
             var key = e.Key == Key.System ? e.SystemKey : e.Key;
-            if (key == Key.Escape) { label.Text = app.HotkeyText; return; }
+            if (key == Key.Escape) { Stop(app.HotkeyLabel); return; }
             if (key is Key.LeftCtrl or Key.RightCtrl or Key.LeftShift or Key.RightShift or Key.LeftAlt or Key.RightAlt or Key.LWin or Key.RWin) return;
             var mods = Keyboard.Modifiers;
             if (mods == ModifierKeys.None || mods == ModifierKeys.Shift) return;   // a bare key would swallow typing everywhere
-            label.Text = app.SetHotkey(mods, key) ? app.HotkeyText : "Taken, try another";
+            var taken = !app.SetHotkey(mods, key);
+            Stop(taken ? "Taken, try another" : app.HotkeyLabel);
         };
         return box;
     }
@@ -1630,21 +1663,32 @@ sealed class App : Application
         return key is { } k && mods != ModifierKeys.None ? (mods, k) : null;
     }
 
+    /// Whether Windows gave us the shortcut; another app may already own it.
+    bool hotkeyWorks;
+
+    public string HotkeyLabel => hotkeyWorks ? HotkeyText : HotkeyText + " (in use by another app)";
+
+    public void PauseHotkey(bool paused)
+    {
+        if (paused) Win.UnregisterHotKey(messages.Handle, 1);
+        else RegisterHotkey();
+    }
+
     bool RegisterHotkey()
     {
+        Win.UnregisterHotKey(messages.Handle, 1);
         uint mods = 0x4000;   // MOD_NOREPEAT
         if (hotkey.Mods.HasFlag(ModifierKeys.Alt)) mods |= 0x1;
         if (hotkey.Mods.HasFlag(ModifierKeys.Control)) mods |= 0x2;
         if (hotkey.Mods.HasFlag(ModifierKeys.Shift)) mods |= 0x4;
         if (hotkey.Mods.HasFlag(ModifierKeys.Windows)) mods |= 0x8;
-        return Win.RegisterHotKey(messages.Handle, 1, mods, (uint)KeyInterop.VirtualKeyFromKey(hotkey.Key));
+        return hotkeyWorks = Win.RegisterHotKey(messages.Handle, 1, mods, (uint)KeyInterop.VirtualKeyFromKey(hotkey.Key));
     }
 
     /// Switches the global shortcut; keeps the old one if another app already owns the new one.
     public bool SetHotkey(ModifierKeys mods, Key key)
     {
         var old = hotkey;
-        Win.UnregisterHotKey(messages.Handle, 1);
         hotkey = (mods, key);
         if (!RegisterHotkey())
         {
@@ -1689,6 +1733,7 @@ sealed class App : Application
         screenshots = new FolderWatcher(folder, 120, p => Store.IsImagePath(p) || new[] { ".mov", ".mp4" }.Contains(Path.GetExtension(p).ToLowerInvariant()), (path, date) =>
         {
             model.Db.InsertIfMissing(ClipKind.File, path, "Screenshot", "f:" + Store.Sha(path), date);
+            model.Db.DropCopiesOf(path);
             if (Prefs.Get("copyScreenshots", true)) Board.WriteFiles(new[] { path }); else Captured();
         });
     }
@@ -1913,13 +1958,7 @@ sealed class App : Application
         HidePeek();
         var front = Win.GetForegroundWindow();
         if (front != Win.Handle(panel)) pasteTarget = front;
-        model.LoadMascots();
-        model.Query = "";
-        model.Filter = "all";
-        model.Previewing = false;
-        model.ShowSettings = false;
-        model.Reload();
-        model.Selection = model.Clips.FirstOrDefault()?.Id;
+        model.Reset();
         model.Unseen = 0;
 
         panel.Opacity = 0;

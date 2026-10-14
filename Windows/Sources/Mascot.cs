@@ -140,12 +140,16 @@ static class Mascots
         return m;
     }
 
-    /// Deletes a custom mascot, its manifest and the image files it names. Built-ins can't be removed.
+    /// Deletes a custom mascot, its manifest and the image files Add made for it (named `id-state.ext`), never a file
+    /// another mascot owns. Built-ins can't be removed.
     public static bool Remove(string id)
     {
         if (Custom().FirstOrDefault(c => c.Id == id) is not { } m) return false;
-        foreach (var f in new[] { m.Idle, m.Hover, m.Active }.OfType<string>().Where(f => !Path.IsPathRooted(f)).Append(id + ".json"))
-            try { File.Delete(Path.Combine(Dir, Path.GetFileName(f))); } catch (IOException) { }
+        var owned = m.Kind != "image" ? Array.Empty<string>() : new[] { ("idle", m.Idle), ("hover", m.Hover), ("active", m.Active) }
+            .Where(s => s.Item2 is { } f && Path.GetFileName(f) == f && f.StartsWith($"{id}-{s.Item1}."))
+            .Select(s => s.Item2!).ToArray();
+        foreach (var f in owned.Append(id + ".json"))
+            try { File.Delete(Path.Combine(Dir, f)); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         if (ActiveId() == id) SetActive("blob"); else Notify();
         return true;
     }
@@ -349,7 +353,17 @@ sealed class GifPlayer
         timer.Tick += (_, _) => Advance();
     }
 
+    static readonly Dictionary<string, (BitmapSource[] Frames, TimeSpan[] Delays)?> Decoded = new();
+
+    /// Frames are decoded once per file version and rendered at the size they're shown (34 px at 3x), not full size.
     public static GifPlayer? Create(string path, Image target)
+    {
+        var key = path + "|" + File.GetLastWriteTimeUtc(path).Ticks;
+        if (!Decoded.TryGetValue(key, out var decoded)) Decoded[key] = decoded = Decode(path);
+        return decoded is { } d ? new GifPlayer(path, target, d.Frames, d.Delays) : null;
+    }
+
+    static (BitmapSource[], TimeSpan[])? Decode(string path)
     {
         try
         {
@@ -357,6 +371,7 @@ sealed class GifPlayer
             if (decoder.Frames.Count == 0) return null;
             int w = decoder.Metadata?.GetQuery("/logscrdesc/Width") is ushort lw ? lw : decoder.Frames[0].PixelWidth;
             int h = decoder.Metadata?.GetQuery("/logscrdesc/Height") is ushort lh ? lh : decoder.Frames[0].PixelHeight;
+            var scale = Math.Min(1.0, 34.0 * 3 / Math.Max(w, h));
             var frames = new List<BitmapSource>();
             var delays = new List<TimeSpan>();
             BitmapSource? previous = null;
@@ -367,10 +382,11 @@ sealed class GifPlayer
                 var visual = new DrawingVisual();
                 using (var dc = visual.RenderOpen())
                 {
+                    dc.PushTransform(new ScaleTransform(scale, scale));
                     if (previous != null) dc.DrawImage(previous, new Rect(0, 0, w, h));
                     dc.DrawImage(f, new Rect(Num("/imgdesc/Left"), Num("/imgdesc/Top"), f.PixelWidth, f.PixelHeight));
                 }
-                var rendered = new RenderTargetBitmap(w, h, 96, 96, PixelFormats.Pbgra32);
+                var rendered = new RenderTargetBitmap((int)Math.Ceiling(w * scale), (int)Math.Ceiling(h * scale), 96, 96, PixelFormats.Pbgra32);
                 rendered.Render(visual);
                 rendered.Freeze();
                 frames.Add(rendered);
@@ -379,9 +395,9 @@ sealed class GifPlayer
                 // Disposal 2 restores the background, so the next frame starts from an empty canvas.
                 previous = meta.GetQuery("/grctlext/Disposal") is byte disposal && disposal == 2 ? null : rendered;
             }
-            return new GifPlayer(path, target, frames.ToArray(), delays.ToArray());
+            return (frames.ToArray(), delays.ToArray());
         }
-        catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException) { return null; }
+        catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException or OutOfMemoryException) { return null; }
     }
 
     public void Play()
@@ -423,7 +439,7 @@ static unsafe class Glyphs
             img.Freeze();
             return img;
         }
-        catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException) { return null; }
+        catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException) { return null; }
     });
 
     static long SafeStamp(string path) { try { return File.GetLastWriteTimeUtc(path).Ticks; } catch (Exception) { return 0; } }
@@ -436,7 +452,7 @@ static unsafe class Glyphs
 
     [DllImport("d2d1.dll")] static extern int D2D1CreateFactory(int type, in Guid riid, IntPtr opts, out IntPtr factory);
     [DllImport("dwrite.dll")] static extern int DWriteCreateFactory(int type, in Guid riid, out IntPtr factory);
-    [DllImport("ole32.dll")] static extern int CoCreateInstance(in Guid clsid, IntPtr outer, int ctx, in Guid riid, out IntPtr obj);
+    [DllImport("ole32.dll")] internal static extern int CoCreateInstance(in Guid clsid, IntPtr outer, int ctx, in Guid riid, out IntPtr obj);
     [DllImport("shlwapi.dll")] static extern IntPtr SHCreateMemStream(byte[] data, uint size);
 
     static readonly Guid IID_ID2D1Factory = new("06152247-6f50-465a-9245-118bfd3b6007");
@@ -454,12 +470,15 @@ static unsafe class Glyphs
     // COM methods are called by vtable slot; the numbers are the method's position in the d2d1/dwrite/wincodec headers.
     static IntPtr Slot(IntPtr com, int i) => (*(IntPtr**)com)[i];
 
+    /// All three factories or none, so a half-made set is never used.
     static bool Ready()
     {
-        if (d2d != IntPtr.Zero) return true;
-        return D2D1CreateFactory(0, IID_ID2D1Factory, IntPtr.Zero, out d2d) >= 0
-            && DWriteCreateFactory(0, IID_IDWriteFactory, out dwrite) >= 0
-            && CoCreateInstance(CLSID_WICImagingFactory, IntPtr.Zero, 1, IID_IWICImagingFactory, out wic) >= 0;
+        if (wic != IntPtr.Zero) return true;
+        if (D2D1CreateFactory(0, IID_ID2D1Factory, IntPtr.Zero, out var f) < 0) return false;
+        if (DWriteCreateFactory(0, IID_IDWriteFactory, out var w) < 0) { Marshal.Release(f); return false; }
+        if (CoCreateInstance(CLSID_WICImagingFactory, IntPtr.Zero, 1, IID_IWICImagingFactory, out var i) < 0) { Marshal.Release(f); Marshal.Release(w); return false; }
+        (d2d, dwrite, wic) = (f, w, i);
+        return true;
     }
 
     static BitmapSource? Draw(int px, Func<IntPtr, bool> paint)

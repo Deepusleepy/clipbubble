@@ -98,7 +98,7 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
         {
             Dictionary<string, object?>? msg;
             try { msg = Store.Json.Deserialize<Dictionary<string, object?>>(line); }
-            catch (ArgumentException) { continue; }
+            catch (Exception e) when (e is ArgumentException or InvalidOperationException) { continue; }   // not a JSON object
             if (msg == null || !msg.TryGetValue("id", out var id) || id == null) continue;   // notifications need no reply
             // One failing request (a locked database, a clipboard another app won't let go of) never stops the server.
             try { Handle(db, output, id, msg); }
@@ -131,7 +131,15 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
         }
     }
 
-    static long? Int(object? o) => o switch { int i => i, long l => l, decimal m => (long)m, double d => (long)d, _ => null };
+    /// Out-of-range numbers count as missing rather than overflowing.
+    static long? Int(object? o) => o switch
+    {
+        int i => i,
+        long l => l,
+        decimal m when m >= long.MinValue && m <= long.MaxValue => (long)m,
+        double d when d >= long.MinValue && d <= long.MaxValue => (long)d,
+        _ => null,
+    };
     static double? Number(object? o) => o switch { int i => i, long l => l, decimal m => (double)m, double d => d, _ => null };
 
     static string Prefix(string s, int n)
@@ -142,7 +150,7 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
 
     public static Dictionary<string, object> Call(Db db, string name, Dictionary<string, object?> a)
     {
-        string Header(Clip c) => $"#{c.Id} · {c.Kind.Name()} · {c.Source} · {c.Created:yyyy-MM-dd HH:mm}";
+        string Header(Clip c) => $"#{c.Id} · {c.Kind.Name()} · {c.Source} · {c.Created.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)}";
         string? S(string k) => a.TryGetValue(k, out var v) ? v as string : null;
 
         switch (name)
@@ -155,6 +163,7 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
                 return Text(string.Join("\n\n", clips.Select(c => Header(c) + "\n" + (c.Kind == ClipKind.Image ? c.File ?? "" : Prefix(c.Text, 300)))));
             case "clipboard_get":
             {
+                Prefs.Reload();
                 if (Int(a.GetValueOrDefault("id")) is not { } id || db.Clip(id) is not { } c) return Text("No item with that id.", error: true);
                 var content = new List<object> { Obj(("type", "text"), ("text", Header(c) + "\n" + (c.Kind == ClipKind.Image ? c.File ?? "" : c.Text))) };
                 if (c.ImagePath is { } p && ImageBase64(p) is { } b64) content.Add(Obj(("type", "image"), ("data", b64), ("mimeType", "image/png")));
@@ -162,6 +171,7 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
             }
             case "clipboard_set":
             {
+                Prefs.Reload();
                 if (S("text") is { } t) { Board.WriteText(t); return Text("Copied text to the clipboard."); }
                 if (Int(a.GetValueOrDefault("id")) is not { } id || db.Clip(id) is not { } c) return Text("Pass text or a valid id.", error: true);
                 Board.Write(c);

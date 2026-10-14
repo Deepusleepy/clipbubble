@@ -41,7 +41,7 @@ static class Store
     /// (the MCP server, or a second write) has the file open at that instant.
     public static void WriteAtomic(string path, byte[] data)
     {
-        var tmp = path + "." + System.Diagnostics.Process.GetCurrentProcess().Id + ".tmp";
+        var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         System.IO.File.WriteAllBytes(tmp, data);
         for (var i = 0; ; i++)
         {
@@ -64,6 +64,30 @@ static class Store
     }
 
     public static readonly JavaScriptSerializer Json = new() { MaxJsonLength = int.MaxValue, RecursionLimit = 64 };
+
+    /// Same pixels, whatever the encoding: a screenshot tool's clipboard copy and the file it saved.
+    public static bool SamePicture(Func<Stream> a, Func<Stream> b)
+    {
+        try
+        {
+            static byte[] Pixels(Func<Stream> open, out int w, out int h)
+            {
+                using var s = open();
+                var frame = new FormatConvertedBitmap(BitmapDecoder.Create(s, BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad).Frames[0],
+                    System.Windows.Media.PixelFormats.Bgra32, null, 0);
+                (w, h) = (frame.PixelWidth, frame.PixelHeight);
+                var px = new byte[w * h * 4];
+                frame.CopyPixels(px, w * 4, 0);
+                return px;
+            }
+            var pa = Pixels(a, out var wa, out var ha);
+            var pb = Pixels(b, out var wb, out var hb);
+            return wa == wb && ha == hb && pa.SequenceEqual(pb);
+        }
+        catch (Exception e) when (e is NotSupportedException or FileFormatException or ArgumentException or IOException or UnauthorizedAccessException) { return false; }
+    }
+
+    public static Stream OpenShared(string path) => new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
 }
 
 /// Unexpected errors go to errors.log in the data folder instead of vanishing (or closing the app).
@@ -201,9 +225,26 @@ sealed class Db : IDisposable
         return Select(tail, args.ToArray());
     }
 
-    public Clip? Clip(long id) => Select("WHERE id = ?", id).FirstOrDefault();
+    /// Switched-off categories stay hidden here too, so an agent can't fetch them by id.
+    public Clip? Clip(long id) => Select("WHERE id = ?" + Prefs.HiddenSql, id).FirstOrDefault();
 
     public bool Exists(string hash) => Select("WHERE hash = ?", hash).Count > 0;
+
+    // Win+PrtScn and Snipping Tool both copy a screenshot and save it. The saved file's row stands for both,
+    // whichever of the two ClipBubble sees first (the Mac never does both, so this is Windows-only).
+    const double ScreenshotWindow = 10;
+
+    /// A screenshot file just arrived: drop the copy of the same picture recorded moments ago.
+    public void DropCopiesOf(string screenshot)
+    {
+        foreach (var c in Select("WHERE kind = 'image' AND created >= ?", Now - ScreenshotWindow))
+            if (c.File is { } f && Store.SamePicture(() => Store.OpenShared(f), () => Store.OpenShared(screenshot))) Delete(c.Id);
+    }
+
+    /// A copied picture is a screenshot that was saved moments ago.
+    public bool IsRecentScreenshot(byte[] png) =>
+        Select("WHERE source = 'Screenshot' AND created >= ?", Now - ScreenshotWindow)
+            .Any(c => Store.SamePicture(() => new MemoryStream(png), () => Store.OpenShared(c.Text)));
 
     public void Delete(string hash)
     {
@@ -291,11 +332,14 @@ static class Prefs
 
     public static T Get<T>(string key, T fallback) => values.TryGetValue(key, out var v) && v is T t ? t : fallback;
 
+    /// Copy, save, then swap: the capture thread may be reading `values`, and memory only changes once the file has.
     public static void Set(string key, object? value)
     {
-        if (value == null) values.Remove(key); else values[key] = value;
+        var next = new Dictionary<string, object?>(values);
+        if (value == null) next.Remove(key); else next[key] = value;
         Directory.CreateDirectory(Paths.Dir);
-        Store.WriteAtomic(File, Encoding.UTF8.GetBytes(Store.Json.Serialize(values)));
+        Store.WriteAtomic(File, Encoding.UTF8.GetBytes(Store.Json.Serialize(next)));
+        values = next;
     }
 
     public static bool On(string key) => Get("save." + key, true);
@@ -359,23 +403,21 @@ static class Board
         Set(data);
     }
 
-    /// PNG keeps transparency for apps that read it; the bitmap is for everything else.
+    /// PNG keeps transparency for apps that read it; the bitmap is for everything else. Unreadable pixels (a file
+    /// still being written) just leave the data without an image.
     static DataObject ImageData(byte[] png)
     {
         var data = new DataObject();
-        data.SetData("PNG", new MemoryStream(png));
-        var frame = BitmapFrame.Create(new MemoryStream(png), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
-        data.SetImage(frame);
+        try
+        {
+            var frame = BitmapFrame.Create(new MemoryStream(png), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+            data.SetData("PNG", new MemoryStream(png));
+            data.SetImage(frame);
+        }
+        catch (Exception e) when (e is NotSupportedException or FileFormatException or ArgumentException) { }
         return data;
     }
 
-    /// Another app can hold the clipboard open for a moment; retry briefly. `copy` keeps the data after we exit.
-    static void Set(DataObject data)
-    {
-        for (var i = 0; ; i++)
-        {
-            try { Clipboard.SetDataObject(data, true); return; }
-            catch (COMException) when (i < 10) { Thread.Sleep(30); }
-        }
-    }
+    /// WPF already retries for about a second if another app holds the clipboard. `copy` keeps the data after we exit.
+    static void Set(DataObject data) => Clipboard.SetDataObject(data, true);
 }
