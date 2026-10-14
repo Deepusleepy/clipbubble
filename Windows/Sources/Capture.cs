@@ -232,7 +232,7 @@ static class Apps
         string name;
         try { name = FileVersionInfo.GetVersionInfo(exe).FileDescription?.Trim() ?? ""; }
         catch (System.IO.FileNotFoundException) { name = ""; }
-        if (name.Length == 0) name = Path.GetFileNameWithoutExtension(exe);
+        name = Readable(name.Length == 0 ? Path.GetFileName(exe) : name);
         lock (PathsByName)
         {
             if (PathsByName.TryGetValue(name, out var known) && known == exe) return name;
@@ -241,6 +241,16 @@ static class Apps
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         }
         return name;
+    }
+
+    /// Some apps (Snipping Tool, many Store apps) give their file name as their description:
+    /// "SnippingTool.exe" reads as "Snipping Tool", "Microsoft.Photos.exe" as "Photos".
+    internal static string Readable(string name)
+    {
+        if (!name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return name;
+        var core = name.Substring(0, name.Length - 4);
+        core = core.Substring(core.LastIndexOf('.') + 1);
+        return System.Text.RegularExpressions.Regex.Replace(core, "(?<=[a-z])(?=[A-Z])", " ");
     }
 
     /// The exe behind a source name seen this session, so rows can show its icon.

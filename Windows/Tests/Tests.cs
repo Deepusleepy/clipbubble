@@ -213,6 +213,14 @@ static class Program
             Check(db.Clips().Count == 1 && File.Exists(clip.File!), "row and its image are both still there");
         }),
 
+        ("app names that are really file names read like names", () =>
+        {
+            Check(Apps.Readable("SnippingTool.exe") == "Snipping Tool", Apps.Readable("SnippingTool.exe"));
+            Check(Apps.Readable("Microsoft.Photos.exe") == "Photos", Apps.Readable("Microsoft.Photos.exe"));
+            Check(Apps.Readable("msedge.exe") == "msedge", "lowercase names stay");
+            Check(Apps.Readable("Google Chrome") == "Google Chrome", "real descriptions are untouched");
+        }),
+
         ("secrets marked by password managers are never read", () =>
         {
             Check(Capture.Read(new FakeClipboard(new[] { DataFormats.UnicodeText, Board.ExcludeFormat }, f => f == DataFormats.UnicodeText ? "pw" : null)) == null, "exclude marker");
