@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="1024">
+      <stop offset="0" stop-color="#25221E"/>
+      <stop offset="1" stop-color="#181614"/>
+    </linearGradient>
+  </defs>
+  <!-- KRNL squircle: warm near-black with a lighter rim -->
+  <rect width="1024" height="1024" rx="230" fill="#302D2B"/>
+  <rect x="14" y="14" width="996" height="996" rx="217" fill="url(#bg)"/>
+  <!-- back bubble: the copy -->
+  <circle cx="584" cy="424" r="236" fill="none" stroke="#FF7AB6" stroke-width="64"/>
+  <!-- front bubble, cut out of the back one by a background-colored gap -->
+  <circle cx="440" cy="584" r="304" fill="url(#bg)"/>
+  <circle cx="440" cy="584" r="268" fill="#FF7AB6"/>
+  <!-- mascot face -->
+  <rect x="338" y="498" width="70" height="122" rx="35" fill="#1F1C19"/>
+  <rect x="472" y="498" width="70" height="122" rx="35" fill="#1F1C19"/>
+  <circle cx="360" cy="527" r="14" fill="#FF7AB6"/>
+  <circle cx="494" cy="527" r="14" fill="#FF7AB6"/>
+  <path d="M 380 690 Q 440 752 500 690" fill="none" stroke="#1F1C19" stroke-width="34" stroke-linecap="round"/>
+</svg>

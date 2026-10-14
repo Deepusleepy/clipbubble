@@ -1,0 +1,4 @@
+ClipBubble.app/
+*.zip
+.DS_Store
+.claude/
