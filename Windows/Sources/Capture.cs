@@ -16,13 +16,16 @@ namespace ClipBubble;
 /// What was on the clipboard, copied out while it was open. Decoding and hashing happen later, off the UI thread.
 sealed record Snapshot(string[] Files, string? Text, byte[]? Png, byte[]? Dib);
 
-/// Listens for clipboard changes and records each one once it has settled.
+/// Listens for clipboard changes and records each one once it has settled. Everything that writes capture history
+/// (copies, new screenshots and downloads, the 7-day backfill) runs in order on one background queue, so the UI
+/// never waits on it and a screenshot's copy and its saved file are always handled one after the other.
 sealed class Capture : IDisposable
 {
     readonly HwndSource listener;
     readonly DispatcherTimer settle = new() { Interval = TimeSpan.FromSeconds(0.6) };
     readonly Recorder recorder = new();
     readonly Action onChange;
+    readonly Dispatcher ui = Dispatcher.CurrentDispatcher;
     Task chain = Task.CompletedTask;
     uint seen, handled;
     (string Name, bool Ours) source = ("", false);
@@ -69,10 +72,19 @@ sealed class Capture : IDisposable
         handled = seen;
         if (data == null || Read(data) is not { } snapshot) return;
         var from = source;
+        Queue(() => recorder.Record(snapshot, from.Name, DateTime.Now, from.Ours), onChange);
+    }
+
+    /// Adds files from a watched folder (`files` is listed on the queue too, so a big backfill never blocks the UI).
+    public void AddFiles(string source, Func<IEnumerable<(string Path, DateTime Added)>> files, Action done) =>
+        Queue(() => { foreach (var (path, added) in files()) recorder.AddFile(path, source, added); return true; }, done);
+
+    void Queue(Func<bool> work, Action done)
+    {
         chain = chain.ContinueWith(_ =>
         {
-            try { if (recorder.Record(snapshot, from.Name, DateTime.Now, from.Ours)) Application.Current?.Dispatcher.BeginInvoke(onChange); }
-            catch (Exception e) { Log.Error(e); }   // e.g. the database stayed locked: this copy is lost, the next one isn't
+            try { if (work()) ui.BeginInvoke(done); }
+            catch (Exception e) { Log.Error(e); }   // e.g. the database stayed locked: this item is lost, the next one isn't
         }, TaskScheduler.Default);
     }
 
@@ -115,6 +127,13 @@ sealed class Recorder
     /// The latest capture and the one before it, to spot tools that paste through the clipboard.
     (string Hash, DateTime At, bool Inserted)? last;
     string? previousHash;
+
+    /// A file found in a watched folder. A new screenshot replaces the copy of the same picture made moments ago.
+    public void AddFile(string path, string source, DateTime added)
+    {
+        db.InsertIfMissing(ClipKind.File, path, source, "f:" + Store.Sha(path), added);
+        if (source == "Screenshot") db.DropCopiesOf(path);
+    }
 
     /// Returns whether anything changed that the UI should show.
     /// `ours` means ClipBubble itself put it on the clipboard (see Db.Upsert's keepSource).

@@ -371,18 +371,19 @@ static class Program
             File.WriteAllBytes(shot, TinyPng(3));
             var reencoded = Reencode(TinyPng(3));
             using var db = new Db();
-            db.InsertIfMissing(ClipKind.File, shot, "Screenshot", "f:" + Store.Sha(shot), DateTime.Now);
-            Check(!new Recorder().Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now), "copy after the file is skipped");
+            var r = new Recorder();
+            r.AddFile(shot, "Screenshot", DateTime.Now);
+            Check(!r.Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now), "copy after the file is skipped");
             Check(db.Clips().Count == 1, "file first: one row");
 
             db.DeleteAll();
-            new Recorder().Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now);
-            db.InsertIfMissing(ClipKind.File, shot, "Screenshot", "f:" + Store.Sha(shot), DateTime.Now);
-            db.DropCopiesOf(shot);
+            r = new Recorder();
+            r.Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now);
+            r.AddFile(shot, "Screenshot", DateTime.Now);
             Check(db.Clips().Single().Source == "Screenshot", "copy first: the file's row replaces it");
 
-            new Recorder().Record(new Snapshot(Array.Empty<string>(), null, TinyPng(5), null), "Paint", DateTime.Now);
-            db.DropCopiesOf(shot);
+            r.Record(new Snapshot(Array.Empty<string>(), null, TinyPng(5), null), "Paint", DateTime.Now);
+            r.AddFile(shot, "Screenshot", DateTime.Now);
             Check(db.Clips().Count == 2, "a different picture copied at the same time stays");
         }),
 

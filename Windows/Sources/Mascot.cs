@@ -470,13 +470,20 @@ static unsafe class Glyphs
     // COM methods are called by vtable slot; the numbers are the method's position in the d2d1/dwrite/wincodec headers.
     static IntPtr Slot(IntPtr com, int i) => (*(IntPtr**)com)[i];
 
+    /// A failed call is logged with its name, so a broken renderer shows up in errors.log instead of as a blank mascot.
+    static bool Ok(int hr, string call)
+    {
+        if (hr < 0) Log.Error(new COMException(call + " failed", hr));
+        return hr >= 0;
+    }
+
     /// All three factories or none, so a half-made set is never used.
     static bool Ready()
     {
         if (wic != IntPtr.Zero) return true;
-        if (D2D1CreateFactory(0, IID_ID2D1Factory, IntPtr.Zero, out var f) < 0) return false;
-        if (DWriteCreateFactory(0, IID_IDWriteFactory, out var w) < 0) { Marshal.Release(f); return false; }
-        if (CoCreateInstance(CLSID_WICImagingFactory, IntPtr.Zero, 1, IID_IWICImagingFactory, out var i) < 0) { Marshal.Release(f); Marshal.Release(w); return false; }
+        if (!Ok(D2D1CreateFactory(0, IID_ID2D1Factory, IntPtr.Zero, out var f), "D2D1CreateFactory")) return false;
+        if (!Ok(DWriteCreateFactory(0, IID_IDWriteFactory, out var w), "DWriteCreateFactory")) { Marshal.Release(f); return false; }
+        if (!Ok(CoCreateInstance(CLSID_WICImagingFactory, IntPtr.Zero, 1, IID_IWICImagingFactory, out var i), "CoCreateInstance(WICImagingFactory)")) { Marshal.Release(f); Marshal.Release(w); return false; }
         (d2d, dwrite, wic) = (f, w, i);
         return true;
     }
@@ -488,17 +495,17 @@ static unsafe class Glyphs
         try
         {
             fixed (Guid* fmt = &PBGRA)
-                if (((delegate* unmanaged[Stdcall]<IntPtr, uint, uint, Guid*, int, IntPtr*, int>)Slot(wic, 17))(wic, (uint)px, (uint)px, fmt, 1, &bmp) < 0) return null;
+                if (!Ok(((delegate* unmanaged[Stdcall]<IntPtr, uint, uint, Guid*, int, IntPtr*, int>)Slot(wic, 17))(wic, (uint)px, (uint)px, fmt, 1, &bmp), "IWICImagingFactory.CreateBitmap")) return null;
             var props = new RtProps { format = 87, alpha = 1 };   // B8G8R8A8, premultiplied
-            if (((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, RtProps*, IntPtr*, int>)Slot(d2d, 13))(d2d, bmp, &props, &rt) < 0) return null;
+            if (!Ok(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, RtProps*, IntPtr*, int>)Slot(d2d, 13))(d2d, bmp, &props, &rt), "ID2D1Factory.CreateWicBitmapRenderTarget")) return null;
             ((delegate* unmanaged[Stdcall]<IntPtr, void>)Slot(rt, 48))(rt);   // BeginDraw
             var clear = new ColorF();
             ((delegate* unmanaged[Stdcall]<IntPtr, ColorF*, void>)Slot(rt, 47))(rt, &clear);
             var ok = paint(rt);
-            if (((delegate* unmanaged[Stdcall]<IntPtr, ulong*, ulong*, int>)Slot(rt, 49))(rt, null, null) < 0 || !ok) return null;   // EndDraw
+            if (!Ok(((delegate* unmanaged[Stdcall]<IntPtr, ulong*, ulong*, int>)Slot(rt, 49))(rt, null, null), "ID2D1RenderTarget.EndDraw") || !ok) return null;
             var pixels = new byte[px * px * 4];
             fixed (byte* p = pixels)
-                if (((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, uint, byte*, int>)Slot(bmp, 7))(bmp, IntPtr.Zero, (uint)px * 4, (uint)pixels.Length, p) < 0) return null;
+                if (!Ok(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, uint, byte*, int>)Slot(bmp, 7))(bmp, IntPtr.Zero, (uint)px * 4, (uint)pixels.Length, p), "IWICBitmap.CopyPixels")) return null;
             var img = BitmapSource.Create(px, px, 96.0 * Scale, 96.0 * Scale, PixelFormats.Pbgra32, null, pixels, px * 4);
             img.Freeze();
             return img;
@@ -516,7 +523,7 @@ static unsafe class Glyphs
         IntPtr created;
         fixed (char* family = "Segoe UI Emoji") fixed (char* locale = "en-us")
             if (((delegate* unmanaged[Stdcall]<IntPtr, char*, IntPtr, int, int, int, float, char*, IntPtr*, int>)Slot(dwrite, 15))(
-                dwrite, family, IntPtr.Zero, 400, 0, 5, px * 0.8f, locale, &created) < 0) return null;
+                dwrite, family, IntPtr.Zero, 400, 0, 5, px * 0.8f, locale, &created) is var hr && !Ok(hr, "IDWriteFactory.CreateTextFormat")) return null;
         var format = created;
         try
         {
@@ -526,7 +533,7 @@ static unsafe class Glyphs
             {
                 var black = new ColorF { a = 1 };
                 IntPtr brush;
-                if (((delegate* unmanaged[Stdcall]<IntPtr, ColorF*, IntPtr, IntPtr*, int>)Slot(rt, 8))(rt, &black, IntPtr.Zero, &brush) < 0) return false;
+                if (!Ok(((delegate* unmanaged[Stdcall]<IntPtr, ColorF*, IntPtr, IntPtr*, int>)Slot(rt, 8))(rt, &black, IntPtr.Zero, &brush), "ID2D1RenderTarget.CreateSolidColorBrush")) return false;
                 var rect = new RectF { r = px, b = px };
                 fixed (char* s = text)
                     ((delegate* unmanaged[Stdcall]<IntPtr, char*, uint, IntPtr, RectF*, IntPtr, int, int, void>)Slot(rt, 27))(
@@ -547,11 +554,11 @@ static unsafe class Glyphs
             return Draw(px, rt =>
             {
                 var iid = IID_ID2D1DeviceContext5;
-                if (Marshal.QueryInterface(rt, ref iid, out var dc5) < 0) return false;
+                if (!Ok(Marshal.QueryInterface(rt, ref iid, out var dc5), "QueryInterface(ID2D1DeviceContext5)")) return false;
                 try
                 {
                     IntPtr doc;
-                    if (((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, SizeF, IntPtr*, int>)Slot(dc5, 115))(dc5, stream, new SizeF { w = px, h = px }, &doc) < 0) return false;
+                    if (!Ok(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, SizeF, IntPtr*, int>)Slot(dc5, 115))(dc5, stream, new SizeF { w = px, h = px }, &doc), "ID2D1DeviceContext5.CreateSvgDocument")) return false;
                     ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, void>)Slot(dc5, 116))(dc5, doc);
                     Marshal.Release(doc);
                     return true;

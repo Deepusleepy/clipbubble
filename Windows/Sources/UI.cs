@@ -1792,11 +1792,10 @@ sealed class App : Application
         if (screenshots?.Folder == folder) return;
         screenshots?.Dispose();
         screenshots = new FolderWatcher(folder, 120, p => Store.IsImagePath(p) || new[] { ".mov", ".mp4" }.Contains(Path.GetExtension(p).ToLowerInvariant()), (path, date) =>
-        {
-            model.Db.InsertIfMissing(ClipKind.File, path, "Screenshot", "f:" + Store.Sha(path), date);
-            model.Db.DropCopiesOf(path);
-            if (Prefs.Get("copyScreenshots", true)) Board.WriteFiles(new[] { path }); else Captured();
-        });
+            capture.AddFiles("Screenshot", () => new[] { (path, date) }, () =>
+            {
+                if (Prefs.Get("copyScreenshots", true)) Board.WriteFiles(new[] { path }); else Captured();
+            }));
     }
 
     /// Watches Downloads only while that's switched on.
@@ -1806,10 +1805,7 @@ sealed class App : Application
         {
             if (downloads != null || FolderWatcher.DownloadsFolder is not { } dir) return;
             downloads = new FolderWatcher(dir, null, p => !FolderWatcher.TempExts.Contains(Path.GetExtension(p).TrimStart('.').ToLowerInvariant()), (path, date) =>
-            {
-                model.Db.InsertIfMissing(ClipKind.File, path, "Downloads", "f:" + Store.Sha(path), date);
-                Captured();
-            });
+                capture.AddFiles("Downloads", () => new[] { (path, date) }, Captured));
         }
         else { downloads?.Dispose(); downloads = null; }
     }
@@ -1819,10 +1815,7 @@ sealed class App : Application
     {
         foreach (var (watcher, source) in new[] { (screenshots, "Screenshot"), (downloads, "Downloads") })
             if (watcher != null)
-                foreach (var (path, date) in watcher.Existing(7))
-                    model.Db.InsertIfMissing(ClipKind.File, path, source, "f:" + Store.Sha(path), date);
-        model.Reload();
-        model.ReloadRecent();
+                capture.AddFiles(source, () => watcher.Existing(7), () => { model.Reload(); model.ReloadRecent(); });
     }
 
     // MARK: Picking
