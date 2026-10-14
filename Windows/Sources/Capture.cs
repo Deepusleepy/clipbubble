@@ -155,13 +155,13 @@ sealed class Recorder
         }
 
         var inserted = !db.Exists(clip.Hash);
+        string? file = null;
         if (clip.Png is { } png)
         {
-            var path = Path.Combine(Paths.Images, clip.Hash.Substring(2) + ".png");
-            if (!File.Exists(path)) Store.WriteAtomic(path, png);
-            clip = clip with { Text = "", File = path };
+            file = Path.Combine(Paths.Images, clip.Hash.Substring(2) + ".png");
+            if (!File.Exists(file)) Store.WriteAtomic(file, png);
         }
-        db.Upsert(clip.Kind, clip.Text, clip.File, source, clip.Hash, keepSource: ours);
+        db.Upsert(clip.Kind, clip.Text, file, source, clip.Hash, keepSource: ours);
         // Checked after writing, like DropCopiesOf on the screenshot side, so whichever of the two lands second
         // removes the copy, even when they arrive at the same moment.
         if (clip.Png is { } shot && db.IsRecentScreenshot(shot))
@@ -174,7 +174,7 @@ sealed class Recorder
         return true;
     }
 
-    record Classified(ClipKind Kind, string Text, string? File, string Hash, byte[]? Png);
+    record Classified(ClipKind Kind, string Text, string Hash, byte[]? Png);
 
     /// Same order as the Mac: files, then an image unless there's real text alongside it, then text.
     static Classified? Classify(Snapshot s)
@@ -184,11 +184,11 @@ sealed class Recorder
         if (s.Files.Length > 0)
         {
             var paths = string.Join("\n", s.Files);
-            return new(ClipKind.File, paths, null, "f:" + Store.Sha(paths), null);
+            return new(ClipKind.File, paths, "f:" + Store.Sha(paths), null);
         }
         if ((trimmed.Length == 0 || looksLikeUrl) && (s.Png ?? DibToPng(s.Dib)) is { } png)
-            return new(ClipKind.Image, "", null, "i:" + Store.Sha(png), png);
-        if (trimmed.Length > 0) return new(ClipKind.Text, s.Text!, null, "t:" + Store.Sha(s.Text!), null);
+            return new(ClipKind.Image, "", "i:" + Store.Sha(png), png);
+        if (trimmed.Length > 0) return new(ClipKind.Text, s.Text!, "t:" + Store.Sha(s.Text!), null);
         return null;
     }
 
@@ -207,12 +207,7 @@ sealed class Recorder
         dib.CopyTo(file, 14);
         try
         {
-            var frame = BitmapDecoder.Create(new MemoryStream(file), BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0];
-            var enc = new PngBitmapEncoder();
-            enc.Frames.Add(frame);
-            using var ms = new MemoryStream();
-            enc.Save(ms);
-            return ms.ToArray();
+            return Store.Png(BitmapDecoder.Create(new MemoryStream(file), BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0]);
         }
         catch (Exception e) when (e is NotSupportedException or FileFormatException or ArgumentException or IOException) { return null; }
     }
@@ -237,17 +232,23 @@ static class Apps
     public static (string Name, bool Ours) ClipboardSource()
     {
         var owner = GetClipboardOwner();
-        Win.GetWindowThreadProcessId(owner != IntPtr.Zero ? owner : Win.GetForegroundWindow(), out var pid);
-        if (!IsOurs((int)pid)) return (Name((int)pid) ?? "Windows", false);
-        Win.GetWindowThreadProcessId(Win.GetForegroundWindow(), out var front);
-        return (IsOurs((int)front) ? "Windows" : Name((int)front) ?? "Windows", true);
+        var exe = ExeOf(owner != IntPtr.Zero ? owner : Win.GetForegroundWindow());
+        if (!IsOurs(exe)) return (Name(exe) ?? "Windows", false);
+        var front = ExeOf(Win.GetForegroundWindow());
+        return (IsOurs(front) ? "Windows" : Name(front) ?? "Windows", true);
     }
 
-    static bool IsOurs(int pid) => ExePath(pid) is { } exe && string.Equals(exe, OwnExe, StringComparison.OrdinalIgnoreCase);
-
-    public static string? Name(int pid)
+    static string? ExeOf(IntPtr hwnd)
     {
-        if (pid == 0 || ExePath(pid) is not { } exe) return null;
+        Win.GetWindowThreadProcessId(hwnd, out var pid);
+        return pid == 0 ? null : ExePath((int)pid);
+    }
+
+    static bool IsOurs(string? exe) => exe != null && string.Equals(exe, OwnExe, StringComparison.OrdinalIgnoreCase);
+
+    static string? Name(string? exe)
+    {
+        if (exe == null) return null;
         string name;
         try { name = FileVersionInfo.GetVersionInfo(exe).FileDescription?.Trim() ?? ""; }
         catch (System.IO.FileNotFoundException) { name = ""; }
@@ -376,7 +377,7 @@ sealed class FolderWatcher : IDisposable
         return Listing().Select(p => (p, Added(p))).Where(x => x.Item2 > cutoff).ToList();
     }
 
-    IEnumerable<string> Listing()
+    List<string> Listing()
     {
         try
         {
@@ -384,13 +385,13 @@ sealed class FolderWatcher : IDisposable
                 .Where(i => (i.Attributes & FileAttributes.Hidden) == 0)
                 .Select(i => i.FullName).Where(include).ToList();
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return Array.Empty<string>(); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return new(); }
     }
 
     void Scan()
     {
         if (stopped) return;
-        var now = Listing().ToList();
+        var now = Listing();
         var fresh = now.Where(p => !known.Contains(p)).ToList();
         known = new HashSet<string>(now);
         DateTime? cutoff = maxAge.HasValue ? DateTime.Now.AddSeconds(-maxAge.Value) : null;

@@ -142,10 +142,13 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
     };
     static double? Number(object? o) => o switch { int i => i, long l => l, decimal m => (double)m, double d => d, _ => null };
 
+    /// The first `n` characters as the user sees them (emoji and accents count once), without walking huge clips.
     static string Prefix(string s, int n)
     {
-        var info = new StringInfo(s);
-        return info.LengthInTextElements > n ? info.SubstringByTextElements(0, n) + "…" : s;
+        var e = StringInfo.GetTextElementEnumerator(s);
+        for (var count = 0; e.MoveNext(); count++)
+            if (count == n) return s.Substring(0, e.ElementIndex) + "…";
+        return s;
     }
 
     public static Dictionary<string, object> Call(Db db, string name, Dictionary<string, object?> a)
@@ -180,8 +183,9 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
             case "mascot_list":
             {
                 var active = Mascots.ActiveId();
-                var custom = new HashSet<string>(Mascots.Custom().Select(m => m.Id));
-                return Text(string.Join("\n", Mascots.All().Select(m =>
+                var customs = Mascots.Custom();
+                var custom = new HashSet<string>(customs.Select(m => m.Id));
+                return Text(string.Join("\n", Mascots.Builtins.Concat(customs).Select(m =>
                 {
                     var line = $"{m.Id} · {m.Name} · {m.Kind}{(custom.Contains(m.Id) ? " · custom" : "")}";
                     if (m.Color != null) line += $" · {m.Color}";
@@ -222,11 +226,7 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
             var frame = BitmapDecoder.Create(new Uri(path), BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad).Frames[0];
             var scale = Math.Min(1.0, 1568.0 / Math.Max(frame.PixelWidth, frame.PixelHeight));
             BitmapSource img = scale < 1 ? new TransformedBitmap(frame, new ScaleTransform(scale, scale)) : frame;
-            var enc = new PngBitmapEncoder();
-            enc.Frames.Add(BitmapFrame.Create(img));
-            using var ms = new MemoryStream();
-            enc.Save(ms);
-            return Convert.ToBase64String(ms.ToArray());
+            return Convert.ToBase64String(Store.Png(img));
         }
         catch (Exception e) when (e is IOException or NotSupportedException or UnauthorizedAccessException or ArgumentException or FileFormatException)
         {

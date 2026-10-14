@@ -6,8 +6,11 @@ namespace ClipBubble
 {
     static class Program
     {
+        /// Names for this data folder's lock and signals, so a test or portable copy never talks to the real one.
+        public static string Named(string what) => @"Local\studio.krnl.clipbubble." + what + "." + Store.Sha(Paths.Dir.ToLowerInvariant()).Substring(0, 12);
+
         /// A second launch asks the running copy to open its panel instead of starting another bubble.
-        public const string OpenEvent = @"Local\studio.krnl.clipbubble.open";
+        public static readonly string OpenEvent = Named("open");
 
         [STAThread]
         static int Main(string[] args)
@@ -17,7 +20,7 @@ namespace ClipBubble
                 Mcp.Run();
                 return 0;
             }
-            using var single = new Mutex(true, @"Local\studio.krnl.clipbubble", out var first);
+            using var single = new Mutex(true, Named("app"), out var first);
             if (!first)
             {
                 AllowSetForegroundWindow(-1);   // ASFW_ANY: we were just launched, so we may hand focus to the running copy

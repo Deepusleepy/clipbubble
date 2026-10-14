@@ -92,6 +92,15 @@ static class Store
     }
 
     public static Stream OpenShared(string path) => new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
+    public static byte[] Png(BitmapSource image)
+    {
+        var enc = new PngBitmapEncoder();
+        enc.Frames.Add(image as BitmapFrame ?? BitmapFrame.Create(image));
+        using var ms = new MemoryStream();
+        enc.Save(ms);
+        return ms.ToArray();
+    }
 }
 
 /// Unexpected errors go to errors.log in the data folder instead of vanishing (or closing the app).
@@ -251,34 +260,18 @@ sealed class Db : IDisposable
         Select("WHERE source = 'Screenshot' AND created >= ?", Now - ScreenshotWindow)
             .Any(c => Store.SamePicture(() => new MemoryStream(png), () => Store.OpenShared(c.Text)));
 
-    // Rows go first and files after, so a delete that fails (a locked database) never leaves a row without its image.
-    public void Delete(string hash)
-    {
-        var gone = Select("WHERE hash = ?", hash);
-        Run("DELETE FROM clips WHERE hash = ?", hash);
-        RemoveFiles(gone);
-    }
-
-    public void Delete(long id)
-    {
-        var gone = Select("WHERE id = ?", id);
-        Run("DELETE FROM clips WHERE id = ?", id);
-        RemoveFiles(gone);
-    }
-
-    public void DeleteAll()
-    {
-        var gone = Select("");
-        Run("DELETE FROM clips");
-        RemoveFiles(gone);
-    }
+    public void Delete(string hash) => DeleteWhere("WHERE hash = ?", hash);
+    public void Delete(long id) => DeleteWhere("WHERE id = ?", id);
+    public void DeleteAll() => DeleteWhere("");
 
     /// Drops everything older than the 7-day retention window.
-    public void Prune()
+    public void Prune() => DeleteWhere("WHERE created < ?", Now - Retention);
+
+    /// Rows go first and files after, so a delete that fails (a locked database) never leaves a row without its image.
+    void DeleteWhere(string where, params object?[] args)
     {
-        var cutoff = Now - Retention;
-        var gone = Select("WHERE created < ?", cutoff);
-        Run("DELETE FROM clips WHERE created < ?", cutoff);
+        var gone = Select(where, args);
+        Run("DELETE FROM clips " + where, args);
         RemoveFiles(gone);
     }
 
@@ -368,12 +361,7 @@ static class Board
         try
         {
             if (Path.GetExtension(path).Equals(".png", StringComparison.OrdinalIgnoreCase)) return System.IO.File.ReadAllBytes(path);
-            var frame = BitmapDecoder.Create(new Uri(path), BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0];
-            var enc = new PngBitmapEncoder();
-            enc.Frames.Add(frame);
-            using var ms = new MemoryStream();
-            enc.Save(ms);
-            return ms.ToArray();
+            return Store.Png(BitmapDecoder.Create(new Uri(path), BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0]);
         }
         catch (Exception e) when (e is IOException or NotSupportedException or UnauthorizedAccessException or ArgumentException) { return null; }
     }

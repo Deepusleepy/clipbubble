@@ -9,7 +9,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -25,10 +24,10 @@ namespace ClipBubble;
 
 // MARK: - Model
 
-/// The app's state. Views subscribe to `Changed` and redraw the part named in it, like a SwiftUI ObservableObject.
 /// What changed in the model, so views redraw only the part they show.
 enum Change { Clips, Recent, Query, Filter, Selection, Previewing, ShowSettings, Unseen, Mascot, Prefs, Shown }
 
+/// The app's state. Views subscribe to `Changed` and redraw the part named in it, like a SwiftUI ObservableObject.
 sealed class Model
 {
     public static readonly (string Tag, string Title)[] Filters =
@@ -102,7 +101,7 @@ sealed class Model
     {
         Glyphs.ClearCache();
         AllMascots = Mascots.All();
-        Mascot = Mascots.Active();
+        Mascot = Mascots.Active(AllMascots);
         Raise(Change.Mascot);
     }
 
@@ -135,16 +134,20 @@ sealed class Model
 /// Decodes small thumbnails off the UI thread and keeps them in memory, so rows never flash.
 static class Thumbs
 {
-    static readonly Dictionary<string, BitmapSource?> Cache = new();   // UI thread only
+    // UI thread only. Requests for a picture that's already decoding wait for that decode instead of starting another.
+    static readonly Dictionary<(string, int), BitmapSource?> Cache = new();
+    static readonly Dictionary<(string, int), List<Action<BitmapSource?>>> Pending = new();
     static readonly Dictionary<string, Size> Dims = new();
 
-    static string Key(string path, int px) => $"{px}|{path}";
-    public static BitmapSource? Cached(string path, int px) => Cache.TryGetValue(Key(path, px), out var b) ? b : null;
     public static Size? SizeOf(string path) => Dims.TryGetValue(path, out var s) ? s : null;
 
+    /// Calls `done` right away for a cached thumbnail, otherwise once it's decoded.
     public static void Load(string path, int px, Action<BitmapSource?> done)
     {
-        if (Cache.TryGetValue(Key(path, px), out var hit)) { done(hit); return; }
+        var key = (path, px);
+        if (Cache.TryGetValue(key, out var hit)) { done(hit); return; }
+        if (Pending.TryGetValue(key, out var waiting)) { waiting.Add(done); return; }
+        Pending[key] = new List<Action<BitmapSource?>> { done };
         var dispatcher = Dispatcher.CurrentDispatcher;
         Task.Run(() =>
         {
@@ -171,9 +174,11 @@ static class Thumbs
             catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException or InvalidOperationException) { }
             dispatcher.BeginInvoke(new Action(() =>
             {
-                if (px <= 64) Cache[Key(path, px)] = img;   // row thumbnails only; full-size previews would pile up
+                if (px <= 64) Cache[key] = img;   // row thumbnails only; full-size previews would pile up
                 if (dims is { } d) Dims[path] = d;
-                done(img);
+                var callbacks = Pending[key];
+                Pending.Remove(key);
+                foreach (var callback in callbacks) callback(img);
             }));
         });
     }
@@ -181,7 +186,7 @@ static class Thumbs
     public static void Prewarm(IEnumerable<Clip> clips)
     {
         foreach (var c in clips)
-            if (c.ImagePath is { } p && !Cache.ContainsKey(Key(p, 64))) Load(p, 64, _ => { });
+            if (c.ImagePath is { } p) Load(p, 64, _ => { });
     }
 }
 
@@ -193,9 +198,7 @@ sealed class Thumb : Border
         var image = new Image { Stretch = fit ? Stretch.Uniform : Stretch.UniformToFill };
         RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.HighQuality);
         Child = image;
-        void Show(BitmapSource? b) { image.Source = b; if (b != null) Background = Brushes.Transparent; }
-        if (Thumbs.Cached(path, px) is { } hit) Show(hit);
-        else Thumbs.Load(path, px, Show);
+        Thumbs.Load(path, px, b => { image.Source = b; if (b != null) Background = Brushes.Transparent; });
     }
 }
 
@@ -225,7 +228,7 @@ static class UI
 
     public static string Glyph(int code) => ((char)code).ToString();
     public static readonly string
-        Search = Glyph(0xE721), Clear = Glyph(0xEB90), Gear = Glyph(0xE713), Clipboard = Glyph(0xE77F), AlignLeft = Glyph(0xE8E4),
+        Search = Glyph(0xE721), Clear = Glyph(0xEB90), Gear = Glyph(0xE713), Clipboard = Glyph(0xE77F),
         Link = Glyph(0xE71B), Camera = Glyph(0xE722), Download = Glyph(0xE896), Back = Glyph(0xE76B), Ok = Glyph(0xEC61),
         Warning = Glyph(0xE7BA), Off = Glyph(0xE738), Plus = Glyph(0xE710), Copy = Glyph(0xE8C8), Check = Glyph(0xE73E),
         Power = Glyph(0xE7E8), Keyboard = Glyph(0xE765);
@@ -906,7 +909,8 @@ sealed class Row : Border
             case ClipKind.File:
                 return string.Join(", ", clip.Paths.Select(Path.GetFileName));
             default:
-                var t = FirstLine.Length > 200 ? FirstLine.Substring(0, 200) : FirstLine;
+                var first = FirstLine;
+                var t = first.Length > 200 ? first.Substring(0, 200) : first;
                 return UI.IsUrl(t) ? t.Replace("https://", "").Replace("http://", "") : t;
         }
     }
@@ -1077,7 +1081,6 @@ sealed class PanelView : Grid
         Keyboard.Focus(search);
         lift.Y = 6;
         UI.Spring(lift, TranslateTransform.YProperty, 0, 0.2, 0.9);
-        RenderRows();
         if (list.Items.Count > 0) list.ScrollIntoView(list.Items[0]);
     }
 
@@ -1190,13 +1193,13 @@ sealed class PreviewPane : Border
     {
         Background = new SolidColorBrush(Color.FromRgb(0x0F, 0x0E, 0x0D));
         if (clip.ImagePath is { } p) Child = new Thumb(p, 1400, fit: true) { Margin = new Thickness(12), Background = Brushes.Transparent };
-        else if (clip.Paths.Length > 0)
+        else if (clip.Paths is { Length: > 0 } paths)
         {
             var stack = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(20) };
-            stack.Children.Add(new Image { Source = Shell.Icon(clip.Paths[0], 128), Width = 64, Height = 64 });
+            stack.Children.Add(new Image { Source = Shell.Icon(paths[0], 128), Width = 64, Height = 64 });
             stack.Children.Add(new TextBox
             {
-                Text = string.Join("\n", clip.Paths), IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+                Text = string.Join("\n", paths), IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
                 Foreground = UI.Secondary, FontFamily = UI.Text, FontSize = 11.5, TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 10, 0, 0),
             });
             Child = stack;
@@ -1228,7 +1231,7 @@ sealed class PeekView : StackPanel
         this.hotkey = hotkey;
         Width = 288;   // 300 with the padding, like SwiftUI's .padding(6).frame(width: 300)
         Margin = new Thickness(6);
-        model.Changed += what => { if (what is Change.Recent or Change.Shown) Render(); };
+        model.Changed += what => { if (what == Change.Recent) Render(); };
         Render();
     }
 
@@ -1298,21 +1301,26 @@ sealed class SettingsView : Grid
         Render();
         // Like the Mac's 2 s refresh: notices folders appearing or becoming readable, without rebuilding
         // (and so interrupting) the controls when nothing changed.
-        ticker.Tick += (_, _) => { if (FolderStatus() != shownStatus) Render(); };
+        ticker.Tick += (_, _) => { if (Folders() != shown) Render(); };
         Action<Change> changed = what => { if (what is Change.Prefs or Change.Mascot) Render(); };
         Loaded += (_, _) => { ticker.Start(); model.Changed += changed; Keyboard.Focus(this); };
         Unloaded += (_, _) => { ticker.Stop(); model.Changed -= changed; };
     }
 
-    string shownStatus = "";
+    (string Shots, bool ShotsOk, string? Downloads, bool DownloadsOk) shown;
 
-    static string FolderStatus() =>
-        $"{FolderWatcher.ScreenshotFolder}|{FolderWatcher.CanRead(FolderWatcher.ScreenshotFolder)}|{FolderWatcher.CanRead(FolderWatcher.DownloadsFolder)}";
+    /// What the folder rows show: where each folder is and whether it can be read.
+    static (string, bool, string?, bool) Folders()
+    {
+        var shots = FolderWatcher.ScreenshotFolder;
+        var downloads = FolderWatcher.DownloadsFolder;
+        return (shots, FolderWatcher.CanRead(shots), downloads, FolderWatcher.CanRead(downloads));
+    }
 
     /// Rebuilt whole (it's small) when something it shows changes.
     void Render()
     {
-        shownStatus = FolderStatus();
+        shown = Folders();
         content.Children.Clear();
 
         var save = Section("Save to history");
@@ -1321,7 +1329,7 @@ sealed class SettingsView : Grid
         save.Children.Add(Note("Turning one off stops saving it and hides what's already there, for your agents too."));
 
         var folders = Section("Folders & permissions");
-        var shots = FolderWatcher.ScreenshotFolder;
+        var shots = shown.Shots;
         var custom = Prefs.Get<string?>("screenshotFolder", null) is { Length: > 0 };
         var shotExtra = new StackPanel();
         var links = new StackPanel { Orientation = Orientation.Horizontal };
@@ -1330,10 +1338,10 @@ sealed class SettingsView : Grid
         shotExtra.Children.Add(links);
         shotExtra.Children.Add(Check("Also copy new ones to the clipboard", Prefs.Get("copyScreenshots", true), on => Prefs.Set("copyScreenshots", on)));
         folders.Children.Add(PermRow(UI.Camera, "Screenshots", shots, custom ? "Folder you picked" : "Where Windows and Snipping Tool save them",
-            Prefs.On("screenshots") ? FolderWatcher.CanRead(shots) : null, "screenshots", shotExtra));
-        var downloads = FolderWatcher.DownloadsFolder;
+            Prefs.On("screenshots") ? shown.ShotsOk : null, "screenshots", shotExtra));
+        var downloads = shown.Downloads;
         folders.Children.Add(PermRow(UI.Download, "Recent downloads", downloads, null,
-            Prefs.On("downloads") ? FolderWatcher.CanRead(downloads) : null, "downloads", null));
+            Prefs.On("downloads") ? shown.DownloadsOk : null, "downloads", null));
         folders.Children.Add(Row(UI.Keyboard, "Auto-paste", "Enter pastes into the app you were in. Apps running as administrator just get a copy.",
             Switch(Prefs.Get("autoPaste", true), on => Prefs.Set("autoPaste", on))));
         folders.Children.Add(Row(UI.Keyboard, "Open ClipBubble", null, HotkeyBox()));
@@ -1611,7 +1619,6 @@ sealed class App : Application
     readonly Model model = new();
     FloatingWindow bubble = null!, panel = null!, peek = null!;
     BubbleView face = null!;
-    PanelView panelView = null!;
     Capture capture = null!;
     FolderWatcher? screenshots, downloads;
     HwndSource messages = null!;
@@ -1642,7 +1649,7 @@ sealed class App : Application
         bubble.Show();
         Snap(animated: false);
 
-        panelView = new PanelView(model, () => new SettingsView(model, this));
+        var panelView = new PanelView(model, () => new SettingsView(model, this));
         panel = new FloatingWindow(420 + 2 * Glass.Shadow, 470 + 2 * Glass.Shadow, keyable: true) { Content = Glass.Wrap(panelView, 16) };
         panel.Deactivated += (_, _) => { if (!modal) HidePanel(); };
         panel.PreviewKeyDown += HandleKey;
@@ -2093,7 +2100,6 @@ sealed class App : Application
         // Re-check at show time: a click may have opened the panel while this was scheduled.
         if (peek.IsVisible || panel.IsVisible || dragging || !(bubbleHover || peekHover)) return;
         model.ReloadRecent();
-        model.Shown();
         model.Unseen = 0;
         UI.Fade(peek, 0, 0, from: 0);
         peek.Show();

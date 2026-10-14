@@ -8,7 +8,6 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
-using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using System.Windows.Threading;
@@ -42,7 +41,7 @@ static class Mascots
 {
     public static readonly string Dir = Path.Combine(Paths.Dir, "mascots");
     static readonly string Settings = Path.Combine(Paths.Dir, "settings.json");
-    public const string ChangedEvent = @"Local\studio.krnl.clipbubble.mascots";
+    public static readonly string ChangedEvent = Program.Named("mascots");
 
     public static readonly Mascot[] Builtins =
     {
@@ -75,7 +74,13 @@ static class Mascots
         catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return "blob"; }
     }
 
-    public static Mascot Active() => All().FirstOrDefault(m => m.Id == ActiveId()) ?? Builtins[0];
+    public static Mascot Active() => Active(All());
+
+    public static Mascot Active(List<Mascot> all)
+    {
+        var id = ActiveId();
+        return all.FirstOrDefault(m => m.Id == id) ?? Builtins[0];
+    }
 
     public static void SetActive(string id)
     {
