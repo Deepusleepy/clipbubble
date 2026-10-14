@@ -392,8 +392,8 @@ sealed class GifPlayer
                 frames.Add(rendered);
                 var delay = Num("/grctlext/Delay");
                 delays.Add(TimeSpan.FromMilliseconds(Math.Max(20, delay * 10)));
-                // Disposal 2 restores the background, so the next frame starts from an empty canvas.
-                previous = meta.GetQuery("/grctlext/Disposal") is byte disposal && disposal == 2 ? null : rendered;
+                // Disposal 2 clears to the background and 3 restores the canvas from before this frame.
+                previous = meta.GetQuery("/grctlext/Disposal") switch { (byte)2 => null, (byte)3 => previous, _ => rendered };
             }
             return (frames.ToArray(), delays.ToArray());
         }

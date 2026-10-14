@@ -194,6 +194,25 @@ static class Program
             Check(snap?.Dib != null && snap.Dib.Length == dib.Length, "DIB requested even though only Bitmap was listed");
         }),
 
+        ("text from an app that only lists ANSI text is still read", () =>
+        {
+            var snap = Capture.Read(new FakeClipboard(new[] { DataFormats.Text }, f => f == DataFormats.UnicodeText ? "plain old text" : null));
+            Check(snap?.Text == "plain old text", "Unicode text requested even though only Text was listed");
+        }),
+
+        ("a delete that fails on a locked database keeps the clip's image", () =>
+        {
+            var r = new Recorder();
+            r.Record(new Snapshot(Array.Empty<string>(), null, TinyPng(7), null), "Paint", DateTime.Now);
+            using var db = new Db();
+            var clip = db.Clips().Single();
+            using (Sql.Hold(Paths.Db, "BEGIN IMMEDIATE"))
+            {
+                try { db.Delete(clip.Id); } catch (InvalidOperationException) { }
+            }
+            Check(db.Clips().Count == 1 && File.Exists(clip.File!), "row and its image are both still there");
+        }),
+
         ("secrets marked by password managers are never read", () =>
         {
             Check(Capture.Read(new FakeClipboard(new[] { DataFormats.UnicodeText, Board.ExcludeFormat }, f => f == DataFormats.UnicodeText ? "pw" : null)) == null, "exclude marker");
@@ -528,6 +547,18 @@ static class Sql
     }
 
     public static void Exec(string path, string sql) => Query(path, sql);
+
+    /// Keeps a second connection open with `sql` applied (for example a write lock) until disposed.
+    public static IDisposable Hold(string path, string sql)
+    {
+        sqlite3_open16(path, out var db);
+        sqlite3_prepare16_v2(db, sql, -1, out var s, IntPtr.Zero);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+        return new Closer(() => sqlite3_close_v2(db));
+    }
+
+    sealed class Closer(Action close) : IDisposable { public void Dispose() => close(); }
 
     [DllImport("winsqlite3.dll", CharSet = CharSet.Unicode)] static extern int sqlite3_open16(string path, out IntPtr db);
     [DllImport("winsqlite3.dll")] static extern int sqlite3_close_v2(IntPtr db);

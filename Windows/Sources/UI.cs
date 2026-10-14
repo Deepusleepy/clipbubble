@@ -1580,7 +1580,7 @@ sealed class SettingsView : Grid
     /// Picks an image or GIF and makes it the mascot.
     void AddMascot()
     {
-        var open = new OpenFileDialog { Filter = "Images|*.png;*.gif;*.jpg;*.jpeg;*.svg;*.webp", Title = "Pick an image or GIF for your mascot. Square with a transparent background looks best." };
+        var open = new OpenFileDialog { Filter = "Images|*.png;*.gif;*.jpg;*.jpeg;*.svg;*.webp;*.heic", Title = "Pick an image or GIF for your mascot. Square with a transparent background looks best." };
         if (app.Modal(() => open.ShowDialog(app.PanelWindow)) != true) return;
         try
         {

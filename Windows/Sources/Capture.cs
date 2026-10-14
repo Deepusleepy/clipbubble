@@ -85,7 +85,9 @@ sealed class Capture : IDisposable
         if (formats.Length == 0 || formats.Contains(Board.ExcludeFormat) || formats.Contains("Clipboard Viewer Ignore")) return null;
         if (formats.Contains("CanIncludeInClipboardHistory") && Bytes(data, "CanIncludeInClipboardHistory") is { Length: >= 4 } allow && BitConverter.ToInt32(allow, 0) == 0) return null;
         var files = formats.Contains(DataFormats.FileDrop) ? Get(data, DataFormats.FileDrop) as string[] : null;
-        var text = formats.Contains(DataFormats.UnicodeText) ? Get(data, DataFormats.UnicodeText) as string : null;
+        // Like the DIB below: apps that only put ANSI text on get a Unicode copy made by Windows on request.
+        var text = formats.Contains(DataFormats.UnicodeText) || formats.Contains(DataFormats.Text) || formats.Contains(DataFormats.OemText)
+            ? Get(data, DataFormats.UnicodeText) as string : null;
         var png = formats.Contains("PNG") ? Bytes(data, "PNG") : null;
         // Asked for even when unlisted: apps that copy only a Bitmap (all .NET apps) get a DIB made by Windows on request.
         var dib = png == null && (formats.Contains(DataFormats.Dib) || formats.Contains(DataFormats.Bitmap)) ? Bytes(data, DataFormats.Dib) : null;
@@ -133,8 +135,6 @@ sealed class Recorder
             return true;
         }
 
-        if (clip.Png is { } shot && db.IsRecentScreenshot(shot)) return false;   // its saved file is already in history
-
         var inserted = !db.Exists(clip.Hash);
         if (clip.Png is { } png)
         {
@@ -143,6 +143,13 @@ sealed class Recorder
             clip = clip with { Text = "", File = path };
         }
         db.Upsert(clip.Kind, clip.Text, clip.File, source, clip.Hash, keepSource: ours);
+        // Checked after writing, like DropCopiesOf on the screenshot side, so whichever of the two lands second
+        // removes the copy, even when they arrive at the same moment.
+        if (clip.Png is { } shot && db.IsRecentScreenshot(shot))
+        {
+            db.Delete(clip.Hash);
+            return false;
+        }
         previousHash = last?.Hash;
         last = (clip.Hash, now, inserted);
         return true;

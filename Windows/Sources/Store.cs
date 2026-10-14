@@ -246,30 +246,35 @@ sealed class Db : IDisposable
         Select("WHERE source = 'Screenshot' AND created >= ?", Now - ScreenshotWindow)
             .Any(c => Store.SamePicture(() => new MemoryStream(png), () => Store.OpenShared(c.Text)));
 
+    // Rows go first and files after, so a delete that fails (a locked database) never leaves a row without its image.
     public void Delete(string hash)
     {
-        RemoveFiles(Select("WHERE hash = ?", hash));
+        var gone = Select("WHERE hash = ?", hash);
         Run("DELETE FROM clips WHERE hash = ?", hash);
+        RemoveFiles(gone);
     }
 
     public void Delete(long id)
     {
-        RemoveFiles(Select("WHERE id = ?", id));
+        var gone = Select("WHERE id = ?", id);
         Run("DELETE FROM clips WHERE id = ?", id);
+        RemoveFiles(gone);
     }
 
     public void DeleteAll()
     {
-        RemoveFiles(Select(""));
+        var gone = Select("");
         Run("DELETE FROM clips");
+        RemoveFiles(gone);
     }
 
     /// Drops everything older than the 7-day retention window.
     public void Prune()
     {
         var cutoff = Now - Retention;
-        RemoveFiles(Select("WHERE created < ?", cutoff));
+        var gone = Select("WHERE created < ?", cutoff);
         Run("DELETE FROM clips WHERE created < ?", cutoff);
+        RemoveFiles(gone);
     }
 
     /// Only our own copies of images are deleted, never a screenshot or download the clip points at.
