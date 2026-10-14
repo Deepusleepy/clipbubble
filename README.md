@@ -55,7 +55,7 @@ git clone https://github.com/rohit3a/clipbubble && cd clipbubble && ./build.sh
 
 ## Windows
 
-The Windows version lives in [`Windows/`](Windows). It's a separate C# app with the same panel, mascots, history database and MCP tools. It needs Windows 10 22H2 or Windows 11 and nothing else. It runs on the .NET Framework that ships with Windows, as one 200 KB `ClipBubble.exe`.
+The Windows version lives in [`Windows/`](Windows). It's a separate C# app with the same panel, mascots, history database and MCP tools. It needs Windows 10 22H2 or Windows 11 and nothing else. It runs on the .NET Framework that ships with Windows, as one 220 KB `ClipBubble.exe`.
 
 **Download:** grab `ClipBubble-Windows.zip` from [Releases](https://github.com/rohit3a/clipbubble/releases/latest), unzip it anywhere and run `ClipBubble.exe`. It isn't signed, so the first launch shows SmartScreen: click **More info** → **Run anyway**.
 
