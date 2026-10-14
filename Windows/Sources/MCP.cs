@@ -100,23 +100,34 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
             try { msg = Store.Json.Deserialize<Dictionary<string, object?>>(line); }
             catch (ArgumentException) { continue; }
             if (msg == null || !msg.TryGetValue("id", out var id) || id == null) continue;   // notifications need no reply
-            var p = msg.TryGetValue("params", out var raw) && raw is Dictionary<string, object?> d ? d : new Dictionary<string, object?>();
-            switch (msg.TryGetValue("method", out var m) ? m as string : null)
+            // One failing request (a locked database, a clipboard another app won't let go of) never stops the server.
+            try { Handle(db, output, id, msg); }
+            catch (Exception e)
             {
-                case "initialize":
-                    Reply(output, id, Obj(("protocolVersion", p.TryGetValue("protocolVersion", out var v) && v is string s ? s : "2025-06-18"),
-                        ("capabilities", Obj(("tools", Obj()))),
-                        ("serverInfo", Obj(("name", "clipbubble"), ("version", "1.1"))),
-                        ("instructions", Instructions)));
-                    break;
-                case "tools/list": Reply(output, id, Obj(("tools", Tools))); break;
-                case "tools/call":
-                    var args = p.TryGetValue("arguments", out var a) && a is Dictionary<string, object?> ad ? ad : new Dictionary<string, object?>();
-                    Reply(output, id, Call(db, p.TryGetValue("name", out var n) ? n as string ?? "" : "", args));
-                    break;
-                case "ping": Reply(output, id, Obj()); break;
-                default: Send(output, Obj(("jsonrpc", "2.0"), ("id", id), ("error", Obj(("code", -32601), ("message", "Method not found"))))); break;
+                Log.Error(e);
+                Send(output, Obj(("jsonrpc", "2.0"), ("id", id), ("error", Obj(("code", -32603), ("message", e.Message)))));
             }
+        }
+    }
+
+    static void Handle(Db db, Stream output, object id, Dictionary<string, object?> msg)
+    {
+        var p = msg.TryGetValue("params", out var raw) && raw is Dictionary<string, object?> d ? d : new Dictionary<string, object?>();
+        switch (msg.TryGetValue("method", out var m) ? m as string : null)
+        {
+            case "initialize":
+                Reply(output, id, Obj(("protocolVersion", p.TryGetValue("protocolVersion", out var v) && v is string s ? s : "2025-06-18"),
+                    ("capabilities", Obj(("tools", Obj()))),
+                    ("serverInfo", Obj(("name", "clipbubble"), ("version", "1.1"))),
+                    ("instructions", Instructions)));
+                break;
+            case "tools/list": Reply(output, id, Obj(("tools", Tools))); break;
+            case "tools/call":
+                var args = p.TryGetValue("arguments", out var a) && a is Dictionary<string, object?> ad ? ad : new Dictionary<string, object?>();
+                Reply(output, id, Call(db, p.TryGetValue("name", out var n) ? n as string ?? "" : "", args));
+                break;
+            case "ping": Reply(output, id, Obj()); break;
+            default: Send(output, Obj(("jsonrpc", "2.0"), ("id", id), ("error", Obj(("code", -32601), ("message", "Method not found"))))); break;
         }
     }
 

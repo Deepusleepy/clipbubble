@@ -71,7 +71,8 @@ sealed class Capture : IDisposable
         var from = source;
         chain = chain.ContinueWith(_ =>
         {
-            if (recorder.Record(snapshot, from, DateTime.Now)) Application.Current?.Dispatcher.BeginInvoke(onChange);
+            try { if (recorder.Record(snapshot, from, DateTime.Now)) Application.Current?.Dispatcher.BeginInvoke(onChange); }
+            catch (Exception e) { Log.Error(e); }   // e.g. the database stayed locked: this copy is lost, the next one isn't
         }, TaskScheduler.Default);
     }
 
@@ -198,7 +199,7 @@ static class Apps
 
     static Dictionary<string, string> Load()
     {
-        try { return Store.Json.Deserialize<Dictionary<string, string>>(System.IO.File.ReadAllText(File)) ?? new(); }
+        try { return Store.Json.Deserialize<Dictionary<string, string>>(Store.ReadText(File)) ?? new(); }
         catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return new(); }
     }
 

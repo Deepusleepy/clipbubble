@@ -207,6 +207,33 @@ static class Program
             Check(Sql.Query(Paths.Db, "SELECT count(*) FROM clips")[0] == "0", "nothing stored");
         }),
 
+        ("a failed database write throws, and the copy isn't treated as saved", () =>
+        {
+            using (new Db()) { }
+            Sql.Exec(Paths.Db, "CREATE TRIGGER refuse BEFORE INSERT ON clips BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+            var r = new Recorder();
+            var threw = false;
+            try { r.Record(Text("important"), "Notepad", DateTime.Now); } catch (InvalidOperationException) { threw = true; }
+            Sql.Exec(Paths.Db, "DROP TRIGGER refuse");
+            Check(threw, "the write error surfaced");
+            Check(r.Record(Text("important"), "Notepad", DateTime.Now.AddSeconds(1)), "the same text is saved on the next try, not skipped as a duplicate");
+            using var db = new Db();
+            Check(db.Clips().Single().Text == "important", "stored");
+        }),
+
+        ("settings save while another process is reading them, and an unreadable file keeps the last switches", () =>
+        {
+            Prefs.SetOn("text", false);
+            var file = Path.Combine(Paths.Dir, "prefs.json");
+            using (new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                Prefs.SetOn("images", false);
+            Prefs.Reload();
+            Check(!Prefs.On("text") && !Prefs.On("images"), "both saved");
+            using (new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                Prefs.Reload();
+            Check(!Prefs.On("text"), "a locked file doesn't reset hidden categories to visible");
+        }),
+
         ("mascot files keep the Mac JSON shape; remove deletes only its own files", () =>
         {
             var fox = Mascots.Add("Fox", "image", null, new() { ["idle"] = Svg });
@@ -295,6 +322,12 @@ static class Program
             Check(Tool("mascot_list", new { }).Contains("pixel-fox · Pixel Fox · image · custom  ← active"), "mascot_list");
             Check(Tool("mascot_remove", new { id = "pixel-fox" }) == "Removed mascot pixel-fox.", "mascot_remove");
             Check(Tool("clipboard_get", new { id = 999999 }) == "No item with that id.", "missing id");
+            Sql.Exec(Paths.Db, "ALTER TABLE clips RENAME TO gone");
+            stdin.WriteLine(json.Serialize(new Dictionary<string, object?> { ["jsonrpc"] = "2.0", ["id"] = ++id, ["method"] = "tools/call", ["params"] = new { name = "clipboard_history", arguments = new { } } }));
+            var failed = json.Deserialize<Dictionary<string, object>>(p.StandardOutput.ReadLine() ?? throw new Exception("server died on a failing request"));
+            Sql.Exec(Paths.Db, "ALTER TABLE gone RENAME TO clips");
+            Check(failed.ContainsKey("error") && (int)failed["id"] == id, "a failing request gets an error reply");
+            Check(Tool("clipboard_history", new { limit = 1 }).Contains("#"), "and the server keeps serving");
             stdin.Close();
             Check(p.WaitForExit(5000), "exits when stdin closes");
         }

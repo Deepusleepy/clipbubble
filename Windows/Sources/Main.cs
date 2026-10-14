@@ -20,12 +20,15 @@ namespace ClipBubble
             using var single = new Mutex(true, @"Local\studio.krnl.clipbubble", out var first);
             if (!first)
             {
+                AllowSetForegroundWindow(-1);   // ASFW_ANY: we were just launched, so we may hand focus to the running copy
                 if (EventWaitHandle.TryOpenExisting(OpenEvent, out var open)) open.Set();
                 return 0;
             }
             new App().Run();
             return 0;
         }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
     }
 }
 

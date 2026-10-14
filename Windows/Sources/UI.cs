@@ -51,7 +51,6 @@ sealed class Model
     public readonly Db Db = new();
 
     public Action<Clip, bool> Pick = (_, _) => { };
-    public Action Dismiss = () => { };
     public Action PrefsChanged = () => { };
     /// Bumps on every open: refocuses search and refreshes relative times.
     public void Shown() => Raise(nameof(Shown));
@@ -467,12 +466,9 @@ static class Win
 
     [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort vk, scan; public uint flags, time; public IntPtr extra; }
     [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx, dy; public uint data, flags, time; public IntPtr extra; }
-    [StructLayout(LayoutKind.Explicit)] struct INPUT
-    {
-        [FieldOffset(0)] public int type;
-        [FieldOffset(8)] public KEYBDINPUT ki;
-        [FieldOffset(8)] public MOUSEINPUT mi;
-    }
+    /// The union is its own struct so the runtime aligns it for 32- and 64-bit alike.
+    [StructLayout(LayoutKind.Explicit)] struct InputUnion { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public MOUSEINPUT mi; }
+    [StructLayout(LayoutKind.Sequential)] struct INPUT { public int type; public InputUnion u; }
 
     public static void NoActivate(Window w, bool noActivate)
     {
@@ -505,30 +501,44 @@ static class Win
 
     public static void SendPaste()
     {
-        INPUT Key(ushort vk, bool up) => new() { type = 1, ki = new KEYBDINPUT { vk = vk, flags = up ? 2u : 0u } };
+        INPUT Key(ushort vk, bool up) => new() { type = 1, u = new InputUnion { ki = new KEYBDINPUT { vk = vk, flags = up ? 2u : 0u } } };
         var inputs = new[] { Key(0x11, false), Key(0x56, false), Key(0x56, true), Key(0x11, true) };
         SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
     }
 
-    /// Windows won't let a normal app type into one running as administrator; those just get the copy.
+    /// Windows silently drops keystrokes sent to an app at a higher integrity level (one running as administrator),
+    /// so those just get the copy.
     public static bool CanPasteInto(IntPtr hwnd)
     {
         GetWindowThreadProcessId(hwnd, out var pid);
-        var process = OpenProcess(0x1000, false, (int)pid);
+        var process = OpenProcess(0x1000, false, (int)pid);   // PROCESS_QUERY_LIMITED_INFORMATION
         if (process == IntPtr.Zero) return false;
+        try { return IntegrityLevel(process) is { } theirs && IntegrityLevel(GetCurrentProcess()) is { } ours && theirs <= ours; }
+        finally { CloseHandle(process); }
+    }
+
+    /// The process token's mandatory label: 0x2000 for normal apps, 0x3000 for elevated ones.
+    static int? IntegrityLevel(IntPtr process)
+    {
+        if (!OpenProcessToken(process, 0x0008, out var token)) return null;   // TOKEN_QUERY
         try
         {
-            if (!OpenProcessToken(process, 0x0008, out var token)) return false;   // elevated processes refuse TOKEN_QUERY
-            CloseHandle(token);
-            return true;
+            GetTokenInformation(token, 25, IntPtr.Zero, 0, out var size);   // TokenIntegrityLevel
+            var buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                if (!GetTokenInformation(token, 25, buffer, size, out _)) return null;
+                var sid = Marshal.ReadIntPtr(buffer);
+                return Marshal.ReadInt32(GetSidSubAuthority(sid, Marshal.ReadByte(GetSidSubAuthorityCount(sid)) - 1));
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
         }
-        finally { CloseHandle(process); }
+        finally { CloseHandle(token); }
     }
 
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
@@ -544,6 +554,10 @@ static class Win
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
     [DllImport("advapi32.dll")] static extern bool OpenProcessToken(IntPtr process, int access, out IntPtr token);
+    [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr buffer, int size, out int needed);
+    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid, int index);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
 }
 
@@ -1102,7 +1116,6 @@ sealed class PanelView : Grid
         return row;
     }
 
-    public void FocusSearch() { search.Focus(); Keyboard.Focus(search); }
 }
 
 /// Ctrl+Y: the selected item at full size.
@@ -1517,6 +1530,9 @@ sealed class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // A bug in one handler shouldn't make the bubble disappear: it's logged and the app carries on.
+        DispatcherUnhandledException += (_, x) => { Log.Error(x.Exception); x.Handled = true; };
+        AppDomain.CurrentDomain.UnhandledException += (_, x) => { if (x.ExceptionObject is Exception ex) Log.Error(ex); };
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
         model.Db.Prune();
         model.Reload();
@@ -1543,7 +1559,6 @@ sealed class App : Application
         peekGlass.MouseLeave += (_, _) => { peekHover = false; UpdatePeek(); };
 
         model.Pick = Pick;
-        model.Dismiss = HidePanel;
         model.PrefsChanged = () => { SyncScreenshots(); SyncDownloads(); ImportFolders(); };
 
         capture = new Capture(Captured);

@@ -37,16 +37,48 @@ static class Store
     public static string Name(this ClipKind k) => k.ToString().ToLowerInvariant();
     public static ClipKind? ParseKind(string? s) => s switch { "text" => ClipKind.Text, "image" => ClipKind.Image, "file" => ClipKind.File, _ => null };
 
-    /// Writes through a temp file so a reader never sees half a file.
+    /// Writes through a temp file so a reader never sees half a file. Retries briefly if another process
+    /// (the MCP server, or a second write) has the file open at that instant.
     public static void WriteAtomic(string path, byte[] data)
     {
-        var tmp = path + ".tmp";
+        var tmp = path + "." + System.Diagnostics.Process.GetCurrentProcess().Id + ".tmp";
         System.IO.File.WriteAllBytes(tmp, data);
-        if (System.IO.File.Exists(path)) System.IO.File.Replace(tmp, path, null);
-        else System.IO.File.Move(tmp, path);
+        for (var i = 0; ; i++)
+        {
+            try
+            {
+                if (System.IO.File.Exists(path)) System.IO.File.Replace(tmp, path, null);
+                else System.IO.File.Move(tmp, path);
+                return;
+            }
+            catch (IOException) when (i < 10) { Thread.Sleep(20); }
+        }
+    }
+
+    /// Reads without blocking a writer from replacing the file at the same moment.
+    public static string ReadText(string path)
+    {
+        using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var r = new StreamReader(f, Encoding.UTF8);
+        return r.ReadToEnd();
     }
 
     public static readonly JavaScriptSerializer Json = new() { MaxJsonLength = int.MaxValue, RecursionLimit = 64 };
+}
+
+/// Unexpected errors go to errors.log in the data folder instead of vanishing (or closing the app).
+static class Log
+{
+    public static void Error(Exception e)
+    {
+        try
+        {
+            var path = Path.Combine(Paths.Dir, "errors.log");
+            if (System.IO.File.Exists(path) && new FileInfo(path).Length > 1_000_000) System.IO.File.Delete(path);
+            System.IO.File.AppendAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {e}{Environment.NewLine}");
+        }
+        catch (Exception) { }   // logging must never be the thing that fails
+    }
 }
 
 static class Paths
@@ -99,11 +131,18 @@ sealed class Db : IDisposable
         return s;
     }
 
+    /// Throws when SQLite reports an error (a database still locked after the 3 s busy timeout, a full disk),
+    /// so a failed write is never mistaken for a saved clip.
     void Run(string sql, params object?[] args)
     {
         var s = Prepare(sql, args);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
+        try { Check(sqlite3_step(s)); }
+        finally { sqlite3_finalize(s); }
+    }
+
+    void Check(int rc)
+    {
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) throw new InvalidOperationException("SQLite: " + Marshal.PtrToStringUni(sqlite3_errmsg16(h)));
     }
 
     List<Clip> Select(string tail, params object?[] args)
@@ -113,13 +152,15 @@ sealed class Db : IDisposable
         {
             string Col(int i) => Marshal.PtrToStringUni(sqlite3_column_text16(s, i)) ?? "";
             var output = new List<Clip>();
-            while (sqlite3_step(s) == SQLITE_ROW)
+            int rc;
+            while ((rc = sqlite3_step(s)) == SQLITE_ROW)
             {
                 if (Store.ParseKind(Col(1)) is not { } kind) continue;
                 output.Add(new Clip(sqlite3_column_int64(s, 0), kind, Col(2),
                     sqlite3_column_type(s, 3) == SQLITE_NULL ? null : Col(3), Col(4),
                     DateTimeOffset.FromUnixTimeMilliseconds((long)(sqlite3_column_double(s, 5) * 1000)).LocalDateTime));
             }
+            Check(rc);
             return output;
         }
         finally { sqlite3_finalize(s); }
@@ -197,7 +238,7 @@ sealed class Db : IDisposable
             if (c.File is { } f && Path.GetDirectoryName(f) == Paths.Images) try { System.IO.File.Delete(f); } catch (IOException) { }
     }
 
-    const int SQLITE_ROW = 100, SQLITE_NULL = 5;
+    const int SQLITE_ROW = 100, SQLITE_DONE = 101, SQLITE_NULL = 5;
     static readonly IntPtr Transient = new(-1);
     [DllImport("winsqlite3.dll", CharSet = CharSet.Unicode)] static extern int sqlite3_open16(string path, out IntPtr db);
     [DllImport("winsqlite3.dll")] static extern int sqlite3_close_v2(IntPtr db);
@@ -234,16 +275,19 @@ static class Prefs
     };
 
     static readonly string File = Path.Combine(Paths.Dir, "prefs.json");
-    static Dictionary<string, object?> values = Load();
+    static Dictionary<string, object?> values = Load() ?? new();
 
-    static Dictionary<string, object?> Load()
+    /// Null when the file can't be read right now; a missing file means defaults.
+    static Dictionary<string, object?>? Load()
     {
-        try { return Store.Json.Deserialize<Dictionary<string, object?>>(System.IO.File.ReadAllText(File)) ?? new(); }
-        catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException) { return new(); }
+        if (!System.IO.File.Exists(File)) return new();
+        try { return Store.Json.Deserialize<Dictionary<string, object?>>(Store.ReadText(File)) ?? new(); }
+        catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return null; }
     }
 
-    /// The MCP server calls this before each query so it sees switches flipped in the running app.
-    public static void Reload() => values = Load();
+    /// The MCP server calls this before each query so it sees switches flipped in the running app. If the file
+    /// can't be read, the last known switches stay, so a hidden category never briefly reappears.
+    public static void Reload() => values = Load() ?? values;
 
     public static T Get<T>(string key, T fallback) => values.TryGetValue(key, out var v) && v is T t ? t : fallback;
 

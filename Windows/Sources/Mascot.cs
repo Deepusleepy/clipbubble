@@ -61,7 +61,7 @@ static class Mascots
     {
         if (!Directory.Exists(Dir)) return new();
         return Directory.GetFiles(Dir, "*.json")
-            .Select(f => { try { return Mascot.FromJson(Store.Json.Deserialize<Dictionary<string, object?>>(File.ReadAllText(f))); } catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException) { return null; } })
+            .Select(f => { try { return Mascot.FromJson(Store.Json.Deserialize<Dictionary<string, object?>>(Store.ReadText(f))); } catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException) { return null; } })
             .OfType<Mascot>()
             .OrderBy(m => m.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
@@ -71,7 +71,7 @@ static class Mascots
 
     public static string ActiveId()
     {
-        try { return Store.Json.Deserialize<Dictionary<string, object?>>(File.ReadAllText(Settings))?.GetValueOrDefault("mascot") as string ?? "blob"; }
+        try { return Store.Json.Deserialize<Dictionary<string, object?>>(Store.ReadText(Settings))?.GetValueOrDefault("mascot") as string ?? "blob"; }
         catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return "blob"; }
     }
 
