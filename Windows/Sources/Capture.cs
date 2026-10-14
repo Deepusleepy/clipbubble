@@ -25,7 +25,7 @@ sealed class Capture : IDisposable
     readonly Action onChange;
     Task chain = Task.CompletedTask;
     uint seen, handled;
-    string? source;
+    (string Name, bool Ours) source = ("", false);
     int busyRetries;
 
     public Capture(Action onChange)
@@ -51,7 +51,7 @@ sealed class Capture : IDisposable
     {
         if (msg != 0x031D) return IntPtr.Zero;   // WM_CLIPBOARDUPDATE
         seen = GetClipboardSequenceNumber();
-        source = Apps.ClipboardOwner();   // who copied it; by the time it settles another app may be in front
+        source = Apps.ClipboardSource();   // who copied it; by the time it settles another app may be in front
         busyRetries = 0;
         settle.Stop();
         settle.Start();
@@ -71,7 +71,7 @@ sealed class Capture : IDisposable
         var from = source;
         chain = chain.ContinueWith(_ =>
         {
-            try { if (recorder.Record(snapshot, from, DateTime.Now)) Application.Current?.Dispatcher.BeginInvoke(onChange); }
+            try { if (recorder.Record(snapshot, from.Name, DateTime.Now, from.Ours)) Application.Current?.Dispatcher.BeginInvoke(onChange); }
             catch (Exception e) { Log.Error(e); }   // e.g. the database stayed locked: this copy is lost, the next one isn't
         }, TaskScheduler.Default);
     }
@@ -115,7 +115,8 @@ sealed class Recorder
     string? previousHash;
 
     /// Returns whether anything changed that the UI should show.
-    public bool Record(Snapshot s, string? source, DateTime now)
+    /// `ours` means ClipBubble itself put it on the clipboard (see Db.Upsert's keepSource).
+    public bool Record(Snapshot s, string source, DateTime now, bool ours = false)
     {
         if (Classify(s) is not { } clip) return false;
         if (clip.Hash == last?.Hash) return false;
@@ -141,7 +142,7 @@ sealed class Recorder
             if (!File.Exists(path)) Store.WriteAtomic(path, png);
             clip = clip with { Text = "", File = path };
         }
-        db.Upsert(clip.Kind, clip.Text, clip.File, source, clip.Hash);
+        db.Upsert(clip.Kind, clip.Text, clip.File, source, clip.Hash, keepSource: ours);
         previousHash = last?.Hash;
         last = (clip.Hash, now, inserted);
         return true;
@@ -205,15 +206,18 @@ static class Apps
         catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return new(); }
     }
 
-    /// The app that owns the clipboard right now, or null when it's ClipBubble itself, including its MCP server
-    /// (picking a clip or clipboard_set keeps the clip's source).
-    public static string? ClipboardOwner()
+    /// The app that put what's on the clipboard there. When that's ClipBubble itself (a picked clip, or its MCP
+    /// server for an agent), it's the app in front instead, like the Mac, and `Ours` is set.
+    public static (string Name, bool Ours) ClipboardSource()
     {
         var owner = GetClipboardOwner();
         Win.GetWindowThreadProcessId(owner != IntPtr.Zero ? owner : Win.GetForegroundWindow(), out var pid);
-        if (ExePath((int)pid) is { } exe && string.Equals(exe, OwnExe, StringComparison.OrdinalIgnoreCase)) return null;
-        return Name((int)pid) ?? "Windows";
+        if (!IsOurs((int)pid)) return (Name((int)pid) ?? "Windows", false);
+        Win.GetWindowThreadProcessId(Win.GetForegroundWindow(), out var front);
+        return (IsOurs((int)front) ? "Windows" : Name((int)front) ?? "Windows", true);
     }
+
+    static bool IsOurs(int pid) => ExePath(pid) is { } exe && string.Equals(exe, OwnExe, StringComparison.OrdinalIgnoreCase);
 
     public static string? Name(int pid)
     {

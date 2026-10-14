@@ -299,14 +299,15 @@ static class UI
     public static readonly IEasingFunction Cubic = new CubicEase { EasingMode = EasingMode.EaseInOut };
 
     /// SwiftUI's `.spring(response:dampingFraction:)`, run for as long as the spring takes to settle.
-    public static void Spring(IAnimatable target, DependencyProperty prop, double to, double response, double damping)
+    /// `from` restarts the motion from a fixed value; without it, it continues from wherever the value is now.
+    public static void Spring(IAnimatable target, DependencyProperty prop, double to, double response, double damping, double? from = null)
     {
         var ease = new SpringEase(response, damping);
-        target.BeginAnimation(prop, new DoubleAnimation(to, new Duration(TimeSpan.FromSeconds(ease.Settle))) { EasingFunction = ease });
+        target.BeginAnimation(prop, new DoubleAnimation(to, new Duration(TimeSpan.FromSeconds(ease.Settle))) { From = from, EasingFunction = ease });
     }
 
-    public static void Fade(UIElement target, double to, double seconds) =>
-        target.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(to, new Duration(TimeSpan.FromSeconds(seconds))));
+    public static void Fade(UIElement target, double to, double seconds, double? from = null) =>
+        target.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(to, new Duration(TimeSpan.FromSeconds(seconds))) { From = from });
 
     /// SwiftUI keyframe tracks: each step animates to `value` over `seconds` with its own curve.
     public static DoubleAnimationUsingKeyFrames Keyframes(params (double Value, double Seconds, IEasingFunction Ease)[] steps)
@@ -631,6 +632,52 @@ static class Glass
     }
 }
 
+/// The Mac's NSAlert in dark mode: Windows' own message box is always light, so this draws one in the panel's style.
+static class Alert
+{
+    /// Returns true when the user picks `action` (Enter); false for Cancel or Esc.
+    public static bool Show(Window owner, string title, string message, string action, string? cancel = "Cancel")
+    {
+        var result = false;
+        var dialog = new Window
+        {
+            Owner = owner, WindowStyle = WindowStyle.None, ResizeMode = ResizeMode.NoResize, AllowsTransparency = true,
+            Background = Brushes.Transparent, ShowInTaskbar = false, Topmost = true, SizeToContent = SizeToContent.WidthAndHeight,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+        };
+        var body = new StackPanel { Width = 280, Margin = new Thickness(18, 16, 18, 14) };
+        var heading = UI.Label(title, 13, UI.Primary, FontWeights.SemiBold);
+        heading.TextWrapping = TextWrapping.Wrap;
+        body.Children.Add(heading);
+        var text = UI.Label(message, 11.5, UI.Secondary);
+        text.TextWrapping = TextWrapping.Wrap;
+        text.Margin = new Thickness(0, 6, 0, 14);
+        body.Children.Add(text);
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        Border Button(string label, bool primary)
+        {
+            var b = new Border
+            {
+                CornerRadius = new CornerRadius(5), Padding = new Thickness(12, 3, 12, 4), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Arrow,
+                Background = primary ? UI.AccentBrush : UI.White(0.14), Child = UI.Label(label, 12, primary ? Brushes.White : UI.Primary, FontWeights.Medium),
+            };
+            b.MouseLeftButtonUp += (_, _) => { result = primary; dialog.Close(); };
+            return b;
+        }
+        if (cancel != null) buttons.Children.Add(Button(cancel, false));
+        buttons.Children.Add(Button(action, true));
+        body.Children.Add(buttons);
+        dialog.Content = Glass.Wrap(body, 12);
+        dialog.PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Enter) { result = true; dialog.Close(); }
+            else if (e.Key == Key.Escape) dialog.Close();
+        };
+        dialog.ShowDialog();
+        return result;
+    }
+}
+
 // MARK: - Bubble face
 
 /// The 64 x 64 bubble: glass circle, mascot, unseen badge and the ring that flashes on capture.
@@ -714,11 +761,9 @@ sealed class BubbleView : Grid
         if (show && badge.Visibility != Visibility.Visible)
         {
             badge.Visibility = Visibility.Visible;
-            scale.ScaleX = scale.ScaleY = 0;
-            badge.Opacity = 0;
-            UI.Spring(scale, ScaleTransform.ScaleXProperty, 1, 0.25, 0.7);
-            UI.Spring(scale, ScaleTransform.ScaleYProperty, 1, 0.25, 0.7);
-            UI.Fade(badge, 1, 0.2);
+            UI.Spring(scale, ScaleTransform.ScaleXProperty, 1, 0.25, 0.7, from: 0);
+            UI.Spring(scale, ScaleTransform.ScaleYProperty, 1, 0.25, 0.7, from: 0);
+            UI.Fade(badge, 1, 0.2, from: 0);
         }
         else if (!show) badge.Visibility = Visibility.Collapsed;
     }
@@ -1216,6 +1261,7 @@ sealed class SettingsView : Grid
     readonly App app;
     readonly StackPanel content = new() { Margin = new Thickness(16) };
     readonly DispatcherTimer ticker = new() { Interval = TimeSpan.FromSeconds(2) };
+    readonly DispatcherTimer copiedReset = new() { Interval = TimeSpan.FromSeconds(1.6) };
 
     public SettingsView(Model model, App app)
     {
@@ -1246,12 +1292,15 @@ sealed class SettingsView : Grid
         SetRow(scroll, 2);
         Children.Add(scroll);
 
+        // Focusable so it can hold the keyboard (Esc) while the list and its search field are hidden.
+        Focusable = true;
+        FocusVisualStyle = null;
         Render();
         // Like the Mac's 2 s refresh: notices folders appearing or becoming readable, without rebuilding
         // (and so interrupting) the controls when nothing changed.
         ticker.Tick += (_, _) => { if (FolderStatus() != shownStatus) Render(); };
         Action<Change> changed = what => { if (what is Change.Prefs or Change.Mascot) Render(); };
-        Loaded += (_, _) => { ticker.Start(); model.Changed += changed; };
+        Loaded += (_, _) => { ticker.Start(); model.Changed += changed; Keyboard.Focus(this); };
         Unloaded += (_, _) => { ticker.Stop(); model.Changed -= changed; };
     }
 
@@ -1319,9 +1368,11 @@ sealed class SettingsView : Grid
         {
             Board.WriteText(Mcp.SetupPrompt(Process.GetCurrentProcess().MainModule!.FileName), transient: true);
             SetButton(copy, "Copied! Paste it into your agent", UI.Check);
-            var reset = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.6) };
-            reset.Tick += (_, _) => { reset.Stop(); SetButton(copy, "Copy setup prompt", UI.Copy); };
-            reset.Start();
+            copiedReset.Stop();
+            copiedReset.Tick -= ResetCopy;
+            copiedReset.Tick += ResetCopy;
+            copiedReset.Start();
+            void ResetCopy(object? s, EventArgs e) { copiedReset.Stop(); SetButton(copy, "Copy setup prompt", UI.Copy); }
         };
         agents.Children.Add(copy);
         agents.Children.Add(Note("Paste it into your agent and it connects itself.", top: 4));
@@ -1483,16 +1534,27 @@ sealed class SettingsView : Grid
         b.Child = row;
     }
 
+    /// Marks the shortcut box while it's waiting for keys, so Esc cancels recording instead of leaving Settings.
+    public const string Recording = "recording";
+
     /// Click, then press the new shortcut. Esc cancels.
     FrameworkElement HotkeyBox()
     {
         var label = UI.Label(app.HotkeyLabel, 11, UI.Primary, FontWeights.Medium);
         var box = new Border { CornerRadius = new CornerRadius(5), Background = UI.White(0.09), Padding = new Thickness(8, 2, 8, 3), Child = label, Focusable = true, Cursor = Cursors.Arrow, FocusVisualStyle = null };
         var recording = false;
-        void Stop(string text) { recording = false; app.PauseHotkey(false); label.Text = text; }
+        void Stop(string text)
+        {
+            recording = false;
+            box.Tag = null;
+            app.PauseHotkey(false);
+            label.Text = text;
+            Keyboard.Focus(this);   // off the box, so Esc goes back to the list again
+        }
         // The current shortcut is switched off while recording, so pressing it again records it instead of closing the panel.
-        box.MouseLeftButtonUp += (_, _) => { recording = true; app.PauseHotkey(true); label.Text = "Press keys…"; box.Focus(); };
+        box.MouseLeftButtonUp += (_, _) => { recording = true; box.Tag = Recording; app.PauseHotkey(true); label.Text = "Press keys…"; box.Focus(); };
         box.LostKeyboardFocus += (_, _) => { if (recording) Stop(app.HotkeyLabel); };
+        box.Unloaded += (_, _) => { if (recording) Stop(app.HotkeyLabel); };
         box.PreviewKeyDown += (_, e) =>
         {
             if (!recording) return;
@@ -1510,7 +1572,7 @@ sealed class SettingsView : Grid
 
     void PickShotsFolder()
     {
-        if (Shell.PickFolder(Win.Handle(app.PanelWindow), FolderWatcher.ScreenshotFolder, "Pick the folder ClipBubble should watch for screenshots") is not { } folder) return;
+        if (app.Modal(() => Shell.PickFolder(Win.Handle(app.PanelWindow), FolderWatcher.ScreenshotFolder, "Pick the folder ClipBubble should watch for screenshots")) is not { } folder) return;
         Prefs.Set("screenshotFolder", folder);
         model.SetPref("screenshots", true);
     }
@@ -1528,14 +1590,13 @@ sealed class SettingsView : Grid
         }
         catch (Exception e) when (e is MascotException or IOException or UnauthorizedAccessException)
         {
-            app.Modal(() => MessageBox.Show(app.PanelWindow, e.Message, "ClipBubble"));
+            app.Modal(() => Alert.Show(app.PanelWindow, "Couldn't add that mascot", e.Message, "OK", cancel: null));
         }
     }
 
     void ClearAll()
     {
-        var answer = app.Modal(() => MessageBox.Show(app.PanelWindow, "This removes every saved item and image. It can't be undone.", "Clear all clipboard history?", MessageBoxButton.OKCancel, MessageBoxImage.Warning));
-        if (answer != MessageBoxResult.OK) return;
+        if (!app.Modal(() => Alert.Show(app.PanelWindow, "Clear all clipboard history?", "This removes every saved item and image. It can't be undone.", "Clear"))) return;
         model.Db.DeleteAll();
         model.Reload();
         model.ReloadRecent();
@@ -1792,7 +1853,7 @@ sealed class App : Application
     {
         if (model.ShowSettings)
         {
-            if (e.Key == Key.Escape && Keyboard.FocusedElement is not Border) { model.ShowSettings = false; e.Handled = true; }
+            if (e.Key == Key.Escape && (Keyboard.FocusedElement as FrameworkElement)?.Tag is not SettingsView.Recording) { model.ShowSettings = false; e.Handled = true; }
             return;
         }
         var ctrl = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
@@ -1843,21 +1904,29 @@ sealed class App : Application
         Animate(bubble, f.Left, f.Top, x, y, 0.32, RestBubble);
     }
 
-    /// Moves a window along cubic-bezier(0.3, 1.35, 0.5, 1), the Mac's overshoot curve.
-    static void Animate(Window w, int x0, int y0, int x1, int y1, double seconds, Action done)
+    EventHandler? snapping;
+
+    void StopSnap()
     {
+        if (snapping != null) CompositionTarget.Rendering -= snapping;
+        snapping = null;
+    }
+
+    /// Moves a window along cubic-bezier(0.3, 1.35, 0.5, 1), the Mac's overshoot curve.
+    void Animate(Window w, int x0, int y0, int x1, int y1, double seconds, Action done)
+    {
+        StopSnap();
         var start = DateTime.Now;
-        EventHandler? tick = null;
-        tick = (_, _) =>
+        snapping = (_, _) =>
         {
             var t = Math.Min(1, (DateTime.Now - start).TotalSeconds / seconds);
             var k = Bezier(t, 0.3, 1.35, 0.5, 1);
             Win.Move(w, (int)Math.Round(x0 + (x1 - x0) * k), (int)Math.Round(y0 + (y1 - y0) * k));
             if (t < 1) return;
-            CompositionTarget.Rendering -= tick;
+            StopSnap();
             done();
         };
-        CompositionTarget.Rendering += tick;
+        CompositionTarget.Rendering += snapping;
     }
 
     static double Bezier(double t, double x1, double y1, double x2, double y2)
@@ -1877,6 +1946,7 @@ sealed class App : Application
 
     void BubbleDown(object sender, MouseButtonEventArgs e)
     {
+        StopSnap();
         downAt = Win.Cursor();
         startFrame = Win.Frame(bubble);
         moved = false;
@@ -1887,7 +1957,7 @@ sealed class App : Application
 
     void BubbleDrag(object sender, MouseEventArgs e)
     {
-        if (!pressed) return;
+        if (!pressed || e.LeftButton != MouseButtonState.Pressed) return;
         var p = Win.Cursor();
         if (!moved)
         {
@@ -1961,7 +2031,7 @@ sealed class App : Application
         model.Reset();
         model.Unseen = 0;
 
-        panel.Opacity = 0;
+        UI.Fade(panel, 0, 0, from: 0);   // shown transparent, then faded in below
         panel.Show();
         var b = Win.Frame(bubble);
         var p = Card(panel);
@@ -1973,7 +2043,7 @@ sealed class App : Application
         MoveCard(panel, Math.Min(Math.Max(x, area.Left + edge), area.Right - pw - edge), Math.Min(Math.Max(y, area.Top + edge), area.Bottom - ph - edge));
         panel.Activate();
         model.Shown();
-        UI.Fade(panel, 1, 0.1);
+        UI.Fade(panel, 1, 0.1, from: 0);
         SetAlpha(1);
     }
 
@@ -1981,6 +2051,7 @@ sealed class App : Application
     void HidePanel()
     {
         if (!panel.IsVisible) return;
+        model.ShowSettings = false;
         panel.Hide();
         RestBubble();
     }
@@ -2031,11 +2102,11 @@ sealed class App : Application
         model.ReloadRecent();
         model.Shown();
         model.Unseen = 0;
-        peek.Opacity = 0;
+        UI.Fade(peek, 0, 0, from: 0);
         peek.Show();
         peek.UpdateLayout();
         PlacePeek();
-        UI.Fade(peek, 1, 0.12);
+        UI.Fade(peek, 1, 0.12, from: 0);
     }
 
     void HidePeek()

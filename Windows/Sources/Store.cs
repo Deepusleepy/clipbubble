@@ -190,13 +190,13 @@ sealed class Db : IDisposable
         finally { sqlite3_finalize(s); }
     }
 
-    /// Inserts a clip, or moves an identical existing one to the top.
-    /// A null source keeps the existing one (our own clipboard writes shouldn't be credited to ClipBubble).
-    public void Upsert(ClipKind kind, string text, string? file, string? source, string hash) =>
+    /// Inserts a clip, or moves an identical existing one to the top. `keepSource` is for ClipBubble's own writes
+    /// (a picked clip, an agent's clipboard_set): a known clip keeps its source, a new one gets `source`.
+    public void Upsert(ClipKind kind, string text, string? file, string source, string hash, bool keepSource = false) =>
         Run(@"INSERT INTO clips(kind,text,file,source,hash,created) VALUES(?,?,?,?,?,?)
               ON CONFLICT(hash) DO UPDATE SET created=excluded.created,
-                source=CASE WHEN clips.source IN ('Screenshot', 'Downloads') OR ?7 IS NULL THEN clips.source ELSE excluded.source END",
-            kind.Name(), text, file, source ?? "", hash, Now, source);
+                source=CASE WHEN clips.source IN ('Screenshot', 'Downloads') OR ?7 THEN clips.source ELSE excluded.source END",
+            kind.Name(), text, file, source, hash, Now, keepSource ? 1 : 0);
 
     /// Adds a clip with its own timestamp, leaving any existing identical clip untouched.
     public void InsertIfMissing(ClipKind kind, string text, string source, string hash, DateTime created) =>

@@ -62,10 +62,11 @@ The Windows version lives in [`Windows/`](Windows). It's a separate C# app with 
 **Or build from source** (needs the [.NET SDK](https://dotnet.microsoft.com/download)):
 
 ```powershell
-git clone https://github.com/rohit3a/clipbubble; cd clipbubble; .\Windows\build.ps1
+git clone https://github.com/rohit3a/clipbubble; cd clipbubble
+powershell -ExecutionPolicy Bypass -File Windows\build.ps1
 ```
 
-`build.ps1` builds the app, installs it to `%LOCALAPPDATA%\Programs\ClipBubble` and launches it. To run the tests, run `dotnet build Windows\Tests\ClipBubble.Tests.csproj -c Release`, then `Windows\Tests\bin\Release\net48\ClipBubble.Tests.exe`.
+Windows blocks unsigned scripts by default, which is why the command allows this one. `build.ps1` builds the app, installs it to `%LOCALAPPDATA%\Programs\ClipBubble` and launches it. To run the tests, run `dotnet build Windows\Tests\ClipBubble.Tests.csproj -c Release`, then `Windows\Tests\bin\Release\net48\ClipBubble.Tests.exe`.
 
 What's different on Windows:
 - <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>Space</kbd> opens the panel. You can change it in Settings. In the panel, <kbd>Ctrl</kbd> replaces <kbd>⌘</kbd> and <kbd>Alt</kbd> replaces <kbd>⌥</kbd>, and <kbd>Ctrl</kbd><kbd>⌫</kbd> deletes.

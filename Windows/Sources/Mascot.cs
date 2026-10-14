@@ -256,6 +256,7 @@ sealed class BlobFace : Grid
     readonly Grid eyes = new() { Margin = new Thickness(0, 0, 0, 0) };
     readonly Grid mouth = new();
     readonly DispatcherTimer blinker = new();
+    readonly DispatcherTimer reopen = new() { Interval = TimeSpan.FromMilliseconds(110) };
     string mood = "";
 
     public BlobFace(Color color)
@@ -273,8 +274,9 @@ sealed class BlobFace : Grid
         Children.Add(Center(cheeks, 0, 3.5));
         Children.Add(Center(mouth, 0, 6.5));
         blinker.Tick += (_, _) => Blink();
+        reopen.Tick += (_, _) => { reopen.Stop(); blink.ScaleY = 1; Schedule(); };
         Loaded += (_, _) => Schedule();
-        Unloaded += (_, _) => blinker.Stop();
+        Unloaded += (_, _) => { blinker.Stop(); reopen.Stop(); };
         SetMood("idle");
     }
 
@@ -296,8 +298,6 @@ sealed class BlobFace : Grid
     {
         blinker.Stop();
         blink.ScaleY = 0.12;
-        var reopen = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(110) };
-        reopen.Tick += (_, _) => { reopen.Stop(); blink.ScaleY = 1; Schedule(); };
         reopen.Start();
     }
 

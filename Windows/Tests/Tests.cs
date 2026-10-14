@@ -77,8 +77,10 @@ static class Program
             db.Upsert(ClipKind.Text, "hi", null, "Notepad", "t:hi");
             db.Upsert(ClipKind.Text, "hi", null, "Code", "t:hi");
             Check(db.Clips(kind: ClipKind.Text).Single().Source == "Code", "re-copy credits the new app");
-            db.Upsert(ClipKind.Text, "hi", null, null, "t:hi");
-            Check(db.Clips(kind: ClipKind.Text).Single().Source == "Code", "our own write keeps the source");
+            db.Upsert(ClipKind.Text, "hi", null, "Windows Terminal", "t:hi", keepSource: true);
+            Check(db.Clips(kind: ClipKind.Text).Single().Source == "Code", "our own write keeps a known clip's source");
+            db.Upsert(ClipKind.Text, "from an agent", null, "Windows Terminal", "t:agent", keepSource: true);
+            Check(db.Clips(query: "agent").Single().Source == "Windows Terminal", "and gives a new clip the app in front");
         }),
 
         ("insertIfMissing never overwrites", () =>
