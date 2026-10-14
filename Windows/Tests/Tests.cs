@@ -631,6 +631,31 @@ static class Snapshots
         var peek = new PeekView(model, () => "Ctrl+Shift+Space");
         Save(Framed(peek, 14, 300, double.NaN), Path.Combine(dir, "peek.png"));
 
+        // Every other state the panel can be in.
+        void State(string name, Action set, Action reset)
+        {
+            set();
+            Pump(0.6);
+            Save(Framed(panel, 16, 420, 470), Path.Combine(dir, name + ".png"));
+            reset();
+        }
+        foreach (var (name, pick) in new (string, Func<Clip, bool>)[] { ("preview-image", c => c.Kind == ClipKind.Image), ("preview-file", c => c.Text.EndsWith(".pdf")), ("preview-text", c => c.Text.StartsWith("func")) })
+            State(name, () => { model.Selection = model.Clips.First(pick).Id; model.Previewing = true; }, () => model.Previewing = false);
+        State("panel-no-matches", () => model.Query = "zzzz", () => model.Query = "");
+        State("panel-filter-screenshots", () => model.Filter = "shots", () => model.Filter = "all");
+        State("panel-search", () => model.Query = "krnl", () => model.Query = "");
+        model.Unseen = 120;
+        var busy = new BubbleView(model) { Background = new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x30)) };
+        model.Unseen = 121;
+        Pump(0.8);
+        Save(busy, Path.Combine(dir, "bubble-badge-99.png"));
+        model.Unseen = 0;
+        using (var db = new Db()) db.DeleteAll();
+        model.Reload();
+        model.ReloadRecent();
+        State("panel-empty", () => { }, () => { });
+        Save(Framed(new PeekView(model, () => "Ctrl+Shift+Space"), 14, 300, double.NaN), Path.Combine(dir, "peek-empty.png"));
+
         foreach (var m in Mascots.Builtins)
         {
             Mascots.SetActive(m.Id);
