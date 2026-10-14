@@ -25,7 +25,8 @@
 ## What it does
 
 - **A floating bubble with a pet.** It stays translucent in a screen corner until you need it. Drag it anywhere and it magnet-snaps to the nearest corner. When it catches a copy, the mascot hops and a badge counts up.
-- **Remembers 7 days of everything.** Text, images, files, **every screenshot** (even the ones you never copied), and copies from your iPhone through Universal Clipboard.
+- **Remembers 7 days of everything.** Text, images, files, **every screenshot** (even the ones you never copied), **recent downloads**, and copies from your iPhone through Universal Clipboard.
+- **You choose what shows up.** Settings (⚙ in the panel) has a switch for each kind. Off means it isn't saved and is hidden everywhere, your agents included.
 - **Paste without hunting.** Press <kbd>⌃⌥V</kbd> anywhere, type to search, and press <kbd>↩</kbd>: it pastes straight into the app you were in. Or drag any item out into Slack, Figma or a browser upload.
 - **Hover to peek** at your last three copies; one click pastes.
 - **Built-in MCP server.** Claude Code, Codex, Cursor and Claude Desktop can read your clipboard history (and actually see the images), put things on your clipboard, and design new mascots for you.
@@ -47,7 +48,7 @@ git clone https://github.com/rohit3a/clipbubble && cd clipbubble && ./build.sh
 
 `build.sh` compiles the app, installs it to `~/Applications` and launches it. Requires macOS 14 or later.
 
-**Permissions:** macOS asks for access to your screenshots folder (usually Desktop) so screenshots land in history. Auto-paste needs **Accessibility** access (System Settings → Privacy & Security → Accessibility); without it, picking an item just copies it.
+**Permissions:** macOS asks for access to your screenshots folder (usually Desktop) and Downloads so those land in history. Auto-paste needs **Accessibility** access (System Settings → Privacy & Security → Accessibility); without it, picking an item just copies it.
 
 ## Keys
 
@@ -60,7 +61,7 @@ git clone https://github.com/rohit3a/clipbubble && cd clipbubble && ./build.sh
 | <kbd>⌘1</kbd>–<kbd>⌘9</kbd> | Paste one of the first nine items |
 | <kbd>⌘Y</kbd> | Full-size preview |
 | <kbd>⌘⌫</kbd> | Delete from history |
-| <kbd>Tab</kbd> | Next filter (All, Text, Images, Files, Screenshots, iPhone) |
+| <kbd>Tab</kbd> | Next filter (All, Text, Images, Files, Screenshots, Downloads, iPhone) |
 | <kbd>Esc</kbd> | Close the preview, clear the search, or close the panel |
 
 ## Mascots
@@ -90,17 +91,19 @@ Custom mascots are small JSON files in `~/Library/Application Support/ClipBubble
 
 ## MCP for AI agents
 
-The app binary doubles as a stdio MCP server. Register it once:
+The app binary doubles as a stdio MCP server. The easiest way to connect an agent: open the panel, click ⚙ → **AI agents (MCP)** → **Copy setup prompt**, and paste it into Claude Code, Codex, Cursor or any other agent. It registers ClipBubble itself, using the exact path of your copy of the app, and checks that it works.
+
+Or register it by hand (adjust the path if the app is in `/Applications`):
 
 ```bash
 claude mcp add --scope user clipbubble -- ~/Applications/ClipBubble.app/Contents/MacOS/ClipBubble --mcp
 ```
 
-For Codex: `codex mcp add clipbubble -- ~/Applications/ClipBubble.app/Contents/MacOS/ClipBubble --mcp`. For Claude Desktop or Cursor, add the same command with the argument `--mcp` to the MCP config.
+For Codex it's `codex mcp add clipbubble -- <same path> --mcp`. For Claude Desktop, Cursor or Windsurf, add `"clipbubble": { "command": "<same path>", "args": ["--mcp"] }` under `mcpServers`.
 
 | Tool | What it does |
 | --- | --- |
-| `clipboard_history` | Recent items, filterable by kind, source (`iPhone`, `Screenshot`, an app name), search text and time |
+| `clipboard_history` | Recent items, filterable by kind, source (`iPhone`, `Screenshot`, `Downloads`, an app name), search text and time |
 | `clipboard_get` | One item in full, including the image itself so the model can see it |
 | `clipboard_set` | Put text or a history item on your clipboard |
 | `mascot_list` / `mascot_set` | See and switch mascots |

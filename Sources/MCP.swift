@@ -4,6 +4,33 @@ import AppKit
 enum MCP {
     static let db = DB()
 
+    static let instructions = """
+        ClipBubble keeps the user's last 7 days of clipboard history on their Mac: text, images, files, screenshots, \
+        downloads and copies from their iPhone. When they mention something they copied, a screenshot they took, a file \
+        they downloaded or "that thing from earlier", look it up with clipboard_history (use query, kind or source to \
+        narrow it) and read it in full with clipboard_get, which returns images so you can see them. Use clipboard_set to \
+        hand the user something to paste. The mascot_* tools change the little character in their ClipBubble bubble.
+        """
+
+    /// A prompt the user pastes into any agent so it registers this server itself.
+    static func setupPrompt(binary: String) -> String {
+        """
+        Connect yourself to ClipBubble, my Mac clipboard history app, via its MCP server.
+
+        It's a local stdio MCP server: command "\(binary)", argument "--mcp". No API key or network.
+
+        Register it with whatever agent you are:
+        - Claude Code: claude mcp add --scope user clipbubble -- "\(binary)" --mcp
+        - Codex: codex mcp add clipbubble -- "\(binary)" --mcp
+        - Cursor, Claude Desktop, Windsurf or anything with a JSON MCP config: add
+          "clipbubble": { "command": "\(binary)", "args": ["--mcp"] } under "mcpServers"
+
+        Then check it works by calling clipboard_history with limit 3 (restart or reload MCP servers first if you need to), \
+        and tell me what you found. Tools: clipboard_history, clipboard_get, clipboard_set, mascot_list, mascot_set, \
+        mascot_add, mascot_remove.
+        """
+    }
+
     static let tools: [[String: Any]] = [
         [
             "name": "clipboard_history",
@@ -12,7 +39,7 @@ enum MCP {
                 "limit": ["type": "integer", "description": "Max items, default 20, max 100"],
                 "kind": ["type": "string", "enum": ["text", "image", "file"]],
                 "query": ["type": "string", "description": "Substring to search text, file paths and source app"],
-                "source": ["type": "string", "description": "Source app name, \"iPhone\" for items copied on iPhone, or \"Screenshot\" for screenshots"],
+                "source": ["type": "string", "description": "Source app name, \"iPhone\" for items copied on iPhone, or \"Screenshot\" / \"Downloads\""],
                 "since_hours": ["type": "number", "description": "Only items from the last N hours"],
             ] as [String: Any]] as [String: Any],
         ],
@@ -74,7 +101,8 @@ enum MCP {
             case "initialize":
                 reply(id, ["protocolVersion": params["protocolVersion"] as? String ?? "2025-06-18",
                            "capabilities": ["tools": [String: Any]()],
-                           "serverInfo": ["name": "clipbubble", "version": "1.0"]])
+                           "serverInfo": ["name": "clipbubble", "version": "1.1"],
+                           "instructions": instructions])
             case "tools/list": reply(id, ["tools": tools])
             case "tools/call": reply(id, call(params["name"] as? String ?? "", params["arguments"] as? [String: Any] ?? [:]))
             case "ping": reply(id, [String: Any]())

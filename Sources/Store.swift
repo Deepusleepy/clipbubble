@@ -88,7 +88,7 @@ final class DB {
         run("""
             INSERT INTO clips(kind,text,file,source,hash,created) VALUES(?,?,?,?,?,?)
             ON CONFLICT(hash) DO UPDATE SET created=excluded.created,
-              source=CASE WHEN clips.source = 'Screenshot' THEN clips.source ELSE excluded.source END
+              source=CASE WHEN clips.source IN ('Screenshot', 'Downloads') THEN clips.source ELSE excluded.source END
             """, kind, text, file, source, hash, Date().timeIntervalSince1970)
     }
 
@@ -112,6 +112,7 @@ final class DB {
         }
         if let source { tail += " AND source = ? COLLATE NOCASE"; args.append(source) }
         if let query, !query.isEmpty { tail += " AND (text LIKE ? OR source LIKE ?)"; args += ["%\(query)%", "%\(query)%"] }
+        tail += Prefs.hiddenSQL
         tail += " ORDER BY created DESC LIMIT ?"
         args.append(limit)
         return select(tail, args)
@@ -148,6 +149,25 @@ final class DB {
     }
 }
 
+/// What gets saved. Off means it isn't captured and existing items are hidden everywhere, MCP included.
+enum Prefs {
+    struct Category { let key, title, icon: String; let detail: String?; let sql: String }
+    static let categories: [Category] = [
+        .init(key: "text", title: "Copied text", icon: "text.alignleft", detail: nil, sql: "kind = 'text' AND source <> 'iPhone'"),
+        .init(key: "images", title: "Copied images", icon: "photo", detail: nil, sql: "kind = 'image' AND source <> 'iPhone'"),
+        .init(key: "files", title: "Copied files", icon: "doc", detail: "Files you copy in Finder",
+              sql: "kind = 'file' AND source NOT IN ('Screenshot', 'Downloads', 'iPhone')"),
+        .init(key: "screenshots", title: "Screenshots", icon: "camera.viewfinder", detail: "Every new screenshot, even ones you don't copy",
+              sql: "source = 'Screenshot'"),
+        .init(key: "downloads", title: "Recent downloads", icon: "arrow.down.circle", detail: "New files in your Downloads folder",
+              sql: "source = 'Downloads'"),
+        .init(key: "iphone", title: "Copies from iPhone", icon: "iphone", detail: "Through Universal Clipboard", sql: "source = 'iPhone'"),
+    ]
+    static func on(_ key: String) -> Bool { UserDefaults.standard.object(forKey: "save." + key) as? Bool ?? true }
+    static func set(_ key: String, _ value: Bool) { UserDefaults.standard.set(value, forKey: "save." + key) }
+    static var hiddenSQL: String { categories.filter { !on($0.key) }.map { " AND NOT (\($0.sql))" }.joined() }
+}
+
 /// Writes clips back to the macOS clipboard.
 enum Board {
     static func pngData(_ path: String) -> Data? {
@@ -167,9 +187,11 @@ enum Board {
         }
     }
 
-    static func writeText(_ s: String) {
+    /// `transient` marks it so clipboard managers (ClipBubble included) don't save it.
+    static func writeText(_ s: String, transient: Bool = false) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
+        if transient { NSPasteboard.general.setString("", forType: .init("org.nspasteboard.TransientType")) }
     }
 
     /// A single image file goes on as both the file and its pixels, so it pastes into Finder and into chat/web apps.

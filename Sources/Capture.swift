@@ -39,6 +39,10 @@ final class Capture {
         let types = Set((pb.types ?? []).map(\.rawValue))
         guard !types.isEmpty, types.isDisjoint(with: Self.skipTypes), let clip = read(pb) else { return }
         if clip.hash == last?.hash { return }
+        let source = types.contains("com.apple.is-remote-clipboard")
+            ? "iPhone" : (NSWorkspace.shared.frontmostApplication?.localizedName ?? "Mac")
+        let category = source == "iPhone" ? "iphone" : (["image": "images", "file": "files"][clip.kind] ?? "text")
+        guard Prefs.on(category) else { return }
 
         // The previous contents came straight back, so what we just saw was a paste-through: drop it,
         // and don't bump the restored item.
@@ -50,8 +54,6 @@ final class Capture {
             return
         }
 
-        let source = types.contains("com.apple.is-remote-clipboard")
-            ? "iPhone" : (NSWorkspace.shared.frontmostApplication?.localizedName ?? "Mac")
         let inserted = !db.exists(hash: clip.hash)
         db.upsert(kind: clip.kind, text: clip.text, file: clip.file, source: source, hash: clip.hash)
         previousHash = last?.hash
@@ -91,24 +93,42 @@ final class Capture {
     }
 }
 
-/// Watches the macOS screenshot folder and hands every new screenshot or recording to `onNew`.
-final class ScreenshotWatcher {
+/// Watches a folder (screenshots, Downloads) and hands each new item that passes `include` to `onNew`.
+final class FolderWatcher {
+    static let tempExts: Set<String> = ["crdownload", "download", "part", "partial", "tmp", "opdownload", "icloud"]
+    static var screenshotFolder: URL {
+        let raw = UserDefaults(suiteName: "com.apple.screencapture")?.string(forKey: "location") ?? "~/Desktop"
+        return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
+    }
+
     let folder: URL
+    private let include: (URL) -> Bool
+    private let maxAge: TimeInterval?
+    private let onNew: (URL, Date) -> Void
     private var known: Set<URL> = []
     private var source: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
-    private let onNew: (URL, Date) -> Void
+    private var stopped = false
 
-    init(onNew: @escaping (URL, Date) -> Void) {
+    /// `maxAge` ignores files older than that (so moving old screenshots in doesn't count); nil takes everything new.
+    init(folder: URL, maxAge: TimeInterval?, include: @escaping (URL) -> Bool, onNew: @escaping (URL, Date) -> Void) {
+        self.folder = folder
+        self.maxAge = maxAge
+        self.include = include
         self.onNew = onNew
-        let raw = UserDefaults(suiteName: "com.apple.screencapture")?.string(forKey: "location") ?? "~/Desktop"
-        folder = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
         known = Set(listing())
         start()
     }
 
+    func stop() {
+        stopped = true
+        source?.cancel()
+        source = nil
+    }
+
     /// Retries until macOS grants access to the folder (the privacy prompt may still be open).
     private func start() {
+        guard !stopped else { return }
         let fd = open(folder.path, O_EVTONLY)
         guard fd >= 0 else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.start() }
@@ -128,30 +148,32 @@ final class ScreenshotWatcher {
         source = src
     }
 
-    static func created(_ u: URL) -> Date {
-        (try? u.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+    static func added(_ u: URL) -> Date {
+        let v = try? u.resourceValues(forKeys: [.addedToDirectoryDateKey, .creationDateKey])
+        return v?.addedToDirectoryDate ?? v?.creationDate ?? .distantPast
     }
 
     /// Everything already in the folder from the last `days` days, for backfilling history.
     func existing(days: Double) -> [(URL, Date)] {
         let cutoff = Date().addingTimeInterval(-days * 86400)
-        return listing().map { ($0, Self.created($0)) }.filter { $0.1 > cutoff }
+        return listing().map { ($0, Self.added($0)) }.filter { $0.1 > cutoff }
     }
 
     private func listing() -> [URL] {
         let urls = (try? FileManager.default.contentsOfDirectory(
-            at: folder, includingPropertiesForKeys: [.creationDateKey], options: [.skipsHiddenFiles])) ?? []
-        return urls.filter { isImagePath($0.path) || ["mov", "mp4"].contains($0.pathExtension.lowercased()) }
+            at: folder, includingPropertiesForKeys: [.creationDateKey, .addedToDirectoryDateKey], options: [.skipsHiddenFiles])) ?? []
+        return urls.filter(include)
     }
 
     private func scan() {
         let now = listing()
         let fresh = now.filter { !known.contains($0) }
         known = Set(now)
-        // Only files created in the last two minutes, so moving old files in doesn't count as new.
-        let cutoff = Date().addingTimeInterval(-120)
-        for (url, date) in fresh.map({ ($0, Self.created($0)) }).filter({ $0.1 > cutoff }).sorted(by: { $0.1 < $1.1 }) {
-            onNew(url, date)
+        let cutoff = maxAge.map { Date().addingTimeInterval(-$0) }
+        for url in fresh.sorted(by: { Self.added($0) < Self.added($1) }) {
+            let date = Self.added(url)
+            if let cutoff, date < cutoff { continue }
+            onNew(url, maxAge == nil ? Date() : date)
         }
     }
 }

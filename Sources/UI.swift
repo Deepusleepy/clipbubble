@@ -8,7 +8,8 @@ import UniformTypeIdentifiers
 
 final class Model: ObservableObject {
     static let filters: [(tag: String, title: String)] =
-        [("all", "All"), ("text", "Text"), ("image", "Images"), ("file", "Files"), ("shots", "Screenshots"), ("iphone", "iPhone")]
+        [("all", "All"), ("text", "Text"), ("image", "Images"), ("file", "Files"), ("shots", "Screenshots"),
+         ("downloads", "Downloads"), ("iphone", "iPhone")]
 
     @Published var clips: [Clip] = []
     @Published var recent: [Clip] = []
@@ -16,6 +17,8 @@ final class Model: ObservableObject {
     @Published var filter = "all" { didSet { if filter != oldValue { reload() } } }
     @Published var selection: Int64?
     @Published var previewing = false
+    @Published var showSettings = false
+    @Published var prefsTick = 0
     @Published var shown = 0          // bumps on every open: refocuses search and refreshes relative times
     @Published var pulse = false
     @Published var pulseTicks = 0
@@ -32,12 +35,13 @@ final class Model: ObservableObject {
     var pick: (Clip, _ paste: Bool) -> Void = { _, _ in }
     var dismiss: () -> Void = {}
     var hoverChanged: () -> Void = {}
+    var prefsChanged: () -> Void = {}
 
     var selected: Clip? { clips.first { $0.id == selection } ?? clips.first }
 
     func reload() {
         let kind = ["text", "image", "file"].contains(filter) ? filter : nil
-        let source = ["iphone": "iPhone", "shots": "Screenshot"][filter]
+        let source = ["iphone": "iPhone", "shots": "Screenshot", "downloads": "Downloads"][filter]
         clips = db.clips(kind: kind, source: source, query: query)
         if !clips.contains(where: { $0.id == selection }) { selection = clips.first?.id }
         Thumbs.prewarm(clips.prefix(40))
@@ -46,6 +50,14 @@ final class Model: ObservableObject {
     func reloadRecent() {
         recent = db.clips(limit: 3)
         Thumbs.prewarm(recent)
+    }
+
+    func setPref(_ key: String, _ on: Bool) {
+        Prefs.set(key, on)
+        prefsTick += 1
+        reload()
+        reloadRecent()
+        prefsChanged()
     }
 
     func loadMascots() {
@@ -320,6 +332,8 @@ struct Row: View, Equatable {
                         Image(systemName: "iphone").font(.system(size: 9.5))
                     } else if clip.source == "Screenshot" {
                         Image(systemName: "camera.viewfinder").font(.system(size: 9.5))
+                    } else if clip.source == "Downloads" {
+                        Image(systemName: "arrow.down.circle").font(.system(size: 9.5))
                     } else if let icon = appIcon(clip.source) {
                         Image(nsImage: icon).resizable().frame(width: 12, height: 12)
                     }
@@ -424,6 +438,20 @@ struct PanelView: View {
     @State private var lift: CGFloat = 0
 
     var body: some View {
+        Group {
+            if model.showSettings { SettingsView(model: model) } else { main }
+        }
+        .frame(width: 420, height: 470)
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.1)))
+        .offset(y: lift)
+        .onChange(of: model.shown) {
+            searchFocused = true
+            lift = 6
+            withAnimation(.spring(response: 0.2, dampingFraction: 0.9)) { lift = 0 }
+        }
+    }
+
+    private var main: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").font(.system(size: 15, weight: .medium)).foregroundStyle(.secondary)
@@ -440,8 +468,8 @@ struct PanelView: View {
                 ForEach(Model.filters, id: \.tag) { f in
                     let on = model.filter == f.tag
                     Button { model.filter = f.tag } label: {
-                        Text(f.title).font(.system(size: 11.5, weight: .medium))
-                            .padding(.horizontal, 9).padding(.vertical, 4)
+                        Text(f.title).font(.system(size: 11.5, weight: .medium)).fixedSize()
+                            .padding(.horizontal, 7).padding(.vertical, 4)
                             .background(Capsule().fill(Color.white.opacity(on ? 0.14 : 0)))
                             .foregroundStyle(on ? Color.primary : Color.secondary)
                             .contentShape(Capsule())
@@ -463,14 +491,6 @@ struct PanelView: View {
 
             Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
             footer
-        }
-        .frame(width: 420, height: 470)
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.1)))
-        .offset(y: lift)
-        .onChange(of: model.shown) {
-            searchFocused = true
-            lift = 6
-            withAnimation(.spring(response: 0.2, dampingFraction: 0.9)) { lift = 0 }
         }
     }
 
@@ -501,37 +521,10 @@ struct PanelView: View {
 
     private var footer: some View {
         HStack(spacing: 14) {
-            Menu {
-                Menu("Mascot") {
-                    Picker("Mascot", selection: Binding(get: { model.mascot.id }, set: { Mascots.setActive($0); model.loadMascots() })) {
-                        ForEach(model.mascots) { Text($0.name).tag($0.id) }
-                    }
-                    .pickerStyle(.inline).labelsHidden()
-                    Divider()
-                    Button("Add custom mascot…", action: addMascot)
-                    Button("Open mascots folder") {
-                        try? FileManager.default.createDirectory(at: Mascots.dir, withIntermediateDirectories: true)
-                        NSWorkspace.shared.open(Mascots.dir)
-                    }
-                }
-                Toggle("Also copy new screenshots to clipboard", isOn: Binding(
-                    get: { UserDefaults.standard.bool(forKey: "copyScreenshots") },
-                    set: { UserDefaults.standard.set($0, forKey: "copyScreenshots") }))
-                Toggle("Open at login", isOn: Binding(
-                    get: { SMAppService.mainApp.status == .enabled },
-                    set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }))
-                if !AXIsProcessTrusted() {
-                    Button("Enable auto-paste…") {
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                    }
-                }
-                Divider()
-                Button("Clear all history…", action: clearAll)
-                Button("Quit ClipBubble") { NSApp.terminate(nil) }
-            } label: {
+            Button { model.showSettings = true } label: {
                 Image(systemName: "gearshape.fill").font(.system(size: 12)).foregroundStyle(.secondary)
             }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .buttonStyle(.plain).help("Settings")
             Spacer()
             Key(keys: "↩", label: "Paste")
             Key(keys: "⌥↩", label: "Copy")
@@ -539,6 +532,143 @@ struct PanelView: View {
             Key(keys: "⌘⌫", label: "Delete")
         }
         .padding(.horizontal, 14).frame(height: 36)
+    }
+
+}
+
+/// Settings, shown in place of the list (⚙ in the footer, Esc to go back).
+struct SettingsView: View {
+    @ObservedObject var model: Model
+    @State private var copyShots = UserDefaults.standard.bool(forKey: "copyScreenshots")
+    @State private var openAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var promptCopied = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button { model.showSettings = false } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                        Text("Settings").font(.system(size: 16, weight: .semibold))
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Text("esc").font(.system(size: 10, weight: .medium, design: .rounded)).foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 16).frame(height: 50)
+            Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    section("Save to history") {
+                        ForEach(Prefs.categories, id: \.key) { c in
+                            toggleRow(c.icon, c.title, c.detail, isOn: Binding(
+                                get: { _ = model.prefsTick; return Prefs.on(c.key) },
+                                set: { model.setPref(c.key, $0) }))
+                        }
+                        Text("Turning one off stops saving it and hides what's already there, for your agents too.")
+                            .font(.system(size: 10.5)).foregroundStyle(.tertiary).padding(.top, 2)
+                    }
+                    section("Screenshots") {
+                        toggleRow("doc.on.clipboard", "Also copy them to the clipboard", "So a new screenshot is ready to paste", isOn: $copyShots)
+                    }
+                    section("Mascot") {
+                        LazyVGrid(columns: Array(repeating: GridItem(.fixed(44), spacing: 8), count: 7), alignment: .leading, spacing: 8) {
+                            ForEach(model.mascots) { m in
+                                ZStack {
+                                    Circle().fill(Color(white: 0.09))
+                                    MascotView(mascot: m, hover: false, pressed: false, happy: false, hoverTicks: 0, happyTicks: 0)
+                                        .scaleEffect(0.8)
+                                }
+                                .frame(width: 42, height: 42)
+                                .overlay(Circle().strokeBorder(m.id == model.mascot.id ? Color.accentColor : Color.white.opacity(0.1),
+                                                               lineWidth: m.id == model.mascot.id ? 2 : 1))
+                                .contentShape(Circle())
+                                .onTapGesture { Mascots.setActive(m.id); model.loadMascots() }
+                                .help(m.name)
+                            }
+                            Button(action: addMascot) {
+                                Image(systemName: "plus").font(.system(size: 14, weight: .semibold)).foregroundStyle(.secondary)
+                                    .frame(width: 42, height: 42)
+                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.18), style: StrokeStyle(lineWidth: 1, dash: [3, 3])))
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain).help("Add your own (PNG, GIF, SVG)")
+                        }
+                    }
+                    section("AI agents (MCP)") {
+                        Text("Let Claude Code, Codex, Cursor and other agents search your history, see your screenshots, put things on your clipboard and design mascots.")
+                            .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            .padding(.bottom, 6)
+                        Button {
+                            Board.writeText(MCP.setupPrompt(binary: Bundle.main.executablePath ?? ""), transient: true)
+                            promptCopied = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { promptCopied = false }
+                        } label: {
+                            Label(promptCopied ? "Copied! Paste it into your agent" : "Copy setup prompt",
+                                  systemImage: promptCopied ? "checkmark" : "doc.on.doc")
+                        }
+                        .controlSize(.small)
+                        Text("Paste it into your agent and it connects itself.")
+                            .font(.system(size: 10.5)).foregroundStyle(.tertiary).padding(.top, 4)
+                    }
+                    section("General") {
+                        toggleRow("power", "Open at login", nil, isOn: $openAtLogin)
+                        if !AXIsProcessTrusted() {
+                            Button {
+                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                            } label: {
+                                row("keyboard", "Turn on auto-paste", "Needs Accessibility access") {
+                                    Image(systemName: "arrow.up.forward").font(.system(size: 11)).foregroundStyle(.secondary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        HStack {
+                            Button("Clear all history…", action: clearAll)
+                            Spacer()
+                            Button("Quit ClipBubble") { NSApp.terminate(nil) }
+                        }
+                        .controlSize(.small).padding(.top, 6)
+                    }
+                }
+                .padding(16)
+            }
+            .scrollIndicators(.never)
+        }
+        .onChange(of: copyShots) { _, on in UserDefaults.standard.set(on, forKey: "copyScreenshots") }
+        .onChange(of: openAtLogin) { _, on in
+            try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+        }
+    }
+
+    private func section<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary)
+                .padding(.bottom, 4)
+            content()
+        }
+    }
+
+    private func toggleRow(_ icon: String, _ title: String, _ detail: String?, isOn: Binding<Bool>) -> some View {
+        row(icon, title, detail) {
+            Toggle("", isOn: isOn).toggleStyle(.switch).controlSize(.mini).labelsHidden()
+        }
+    }
+
+    private func row<T: View>(_ icon: String, _ title: String, _ detail: String?, @ViewBuilder trailing: () -> T) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 13, weight: .medium))
+                if let detail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary) }
+            }
+            Spacer(minLength: 8)
+            trailing()
+        }
+        .padding(.vertical, 5)
     }
 
     /// Picks an image or GIF and makes it the mascot.
@@ -643,7 +773,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var peek: FloatingPanel!
     private var peekHost: NSView!
     private var capture: Capture!
-    private var screenshots: ScreenshotWatcher!
+    private var screenshots: FolderWatcher!
+    private var downloads: FolderWatcher?
     private var clickMonitor: Any?
     private var keyMonitor: Any?
     private var hotKey: EventHotKeyRef?
@@ -698,15 +829,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         capture = Capture { [weak self] in DispatchQueue.main.async { self?.captured() } }
         // Every screenshot lands in history; copying it to the clipboard as well is optional.
-        screenshots = ScreenshotWatcher { [weak self] url, date in
+        screenshots = FolderWatcher(folder: FolderWatcher.screenshotFolder, maxAge: 120,
+                                    include: { isImagePath($0.path) || ["mov", "mp4"].contains($0.pathExtension.lowercased()) }) { [weak self] url, date in
+            guard Prefs.on("screenshots") else { return }
             self?.model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: "f:" + sha(url.path), created: date)
             if UserDefaults.standard.bool(forKey: "copyScreenshots") { Board.writeFiles([url]) } else { self?.captured() }
         }
-        importScreenshots()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.importScreenshots() }
+        syncDownloads()
+        model.prefsChanged = { [weak self] in self?.syncDownloads(); self?.importFolders() }
+        importFolders()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.importFolders() }
         Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             self?.model.db.prune()
-            self?.importScreenshots()
+            self?.importFolders()
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in self?.snap(animated: false) }
@@ -719,10 +854,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKey()
     }
 
-    /// Backfills the last 7 days of screenshots. Cheap and idempotent, so it also reruns after access is granted.
-    private func importScreenshots() {
-        for (url, date) in screenshots.existing(days: 7) {
-            model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: "f:" + sha(url.path), created: date)
+    /// Watches ~/Downloads only while that's switched on (so the privacy prompt only shows up if you want it).
+    private func syncDownloads() {
+        if Prefs.on("downloads") {
+            guard downloads == nil, let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return }
+            downloads = FolderWatcher(folder: dir, maxAge: nil,
+                                      include: { !FolderWatcher.tempExts.contains($0.pathExtension.lowercased()) }) { [weak self] url, date in
+                self?.model.db.insertIfMissing(kind: "file", text: url.path, source: "Downloads", hash: "f:" + sha(url.path), created: date)
+                self?.captured()
+            }
+        } else {
+            downloads?.stop()
+            downloads = nil
+        }
+    }
+
+    /// Backfills the last 7 days of screenshots and downloads. Cheap and idempotent, so it also reruns after access is granted.
+    private func importFolders() {
+        if Prefs.on("screenshots") {
+            for (url, date) in screenshots.existing(days: 7) {
+                model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: "f:" + sha(url.path), created: date)
+            }
+        }
+        if let downloads {
+            for (url, date) in downloads.existing(days: 7) {
+                model.db.insertIfMissing(kind: "file", text: url.path, source: "Downloads", hash: "f:" + sha(url.path), created: date)
+            }
         }
         model.reload()
         model.reloadRecent()
@@ -779,6 +936,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleKey(_ e: NSEvent) -> NSEvent? {
         guard panel.isKeyWindow else { return e }
+        if model.showSettings {
+            if Int(e.keyCode) == kVK_Escape { model.showSettings = false; return nil }
+            return e
+        }
         let cmd = e.modifierFlags.contains(.command), opt = e.modifierFlags.contains(.option)
         switch Int(e.keyCode) {
         case kVK_DownArrow: model.move(1)
@@ -860,6 +1021,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.query = ""
         model.filter = "all"
         model.previewing = false
+        model.showSettings = false
         model.reload()
         model.selection = model.clips.first?.id
         model.unseen = 0
