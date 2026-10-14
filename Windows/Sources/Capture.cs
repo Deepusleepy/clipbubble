@@ -76,7 +76,7 @@ sealed class Capture : IDisposable
     }
 
     /// Copies the formats we care about. Copies marked as secret by password managers are never read.
-    static Snapshot? Read(IDataObject data)
+    internal static Snapshot? Read(IDataObject data)
     {
         string[] formats;
         try { formats = data.GetFormats(false); }
@@ -86,7 +86,8 @@ sealed class Capture : IDisposable
         var files = formats.Contains(DataFormats.FileDrop) ? Get(data, DataFormats.FileDrop) as string[] : null;
         var text = formats.Contains(DataFormats.UnicodeText) ? Get(data, DataFormats.UnicodeText) as string : null;
         var png = formats.Contains("PNG") ? Bytes(data, "PNG") : null;
-        var dib = png == null && formats.Contains(DataFormats.Dib) ? Bytes(data, DataFormats.Dib) : null;
+        // Asked for even when unlisted: apps that copy only a Bitmap (all .NET apps) get a DIB made by Windows on request.
+        var dib = png == null && (formats.Contains(DataFormats.Dib) || formats.Contains(DataFormats.Bitmap)) ? Bytes(data, DataFormats.Dib) : null;
         return new Snapshot(files ?? Array.Empty<string>(), text, png, dib);
     }
 

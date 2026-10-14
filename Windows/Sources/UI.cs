@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -310,6 +311,46 @@ static class UI
     }
 
     public static BitmapSource? ShellIcon(string path, int px) => Shell.Icon(path, px);
+
+    /// A dark menu like macOS's: rounded, translucent-looking, accent highlight on the hovered item.
+    public static ContextMenu Menu()
+    {
+        var menu = new ContextMenu { HasDropShadow = true };
+        var frame = new FrameworkElementFactory(typeof(Border));
+        frame.SetValue(Border.BackgroundProperty, new SolidColorBrush(Color.FromRgb(0x2B, 0x2A, 0x28)));
+        frame.SetValue(Border.BorderBrushProperty, White(0.12));
+        frame.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+        frame.SetValue(Border.CornerRadiusProperty, new CornerRadius(7));
+        frame.SetValue(Border.PaddingProperty, new Thickness(5));
+        var items = new FrameworkElementFactory(typeof(ItemsPresenter));
+        frame.AppendChild(items);
+        menu.Template = new ControlTemplate(typeof(ContextMenu)) { VisualTree = frame };
+
+        var row = new FrameworkElementFactory(typeof(Border), "row");
+        row.SetValue(Border.CornerRadiusProperty, new CornerRadius(4));
+        row.SetValue(Border.PaddingProperty, new Thickness(10, 3, 24, 4));
+        row.SetValue(Border.BackgroundProperty, Brushes.Transparent);
+        var header = new FrameworkElementFactory(typeof(ContentPresenter));
+        header.SetValue(ContentPresenter.ContentSourceProperty, "Header");
+        row.AppendChild(header);
+        var template = new ControlTemplate(typeof(MenuItem)) { VisualTree = row };
+        template.Triggers.Add(new Trigger { Property = MenuItem.IsHighlightedProperty, Value = true, Setters = { new Setter(Border.BackgroundProperty, AccentBrush, "row") } });
+        var item = new Style(typeof(MenuItem));
+        item.Setters.Add(new Setter(Control.TemplateProperty, template));
+        item.Setters.Add(new Setter(TextElement.FontFamilyProperty, Text));
+        item.Setters.Add(new Setter(TextElement.FontSizeProperty, 13.0));
+        item.Setters.Add(new Setter(TextElement.ForegroundProperty, Primary));
+        menu.Resources[typeof(MenuItem)] = item;
+
+        var line = new FrameworkElementFactory(typeof(Border));
+        line.SetValue(FrameworkElement.HeightProperty, 1.0);
+        line.SetValue(FrameworkElement.MarginProperty, new Thickness(10, 5, 10, 5));
+        line.SetValue(Border.BackgroundProperty, White(0.12));
+        var separator = new Style(typeof(Separator));
+        separator.Setters.Add(new Setter(Control.TemplateProperty, new ControlTemplate(typeof(Separator)) { VisualTree = line }));
+        menu.Resources[typeof(Separator)] = separator;
+        return menu;
+    }
 }
 
 /// A damped spring with SwiftUI's parameters: `response` is the period, `damping` the damping fraction.
@@ -734,7 +775,7 @@ sealed class Row : Border
             model.Pick(clip, !Keyboard.Modifiers.HasFlag(ModifierKeys.Alt));
         };
         // Built on first right-click: making a menu for every row up front costs more than the rows themselves.
-        ContextMenu = new ContextMenu();
+        ContextMenu = UI.Menu();
         ContextMenuOpening += (_, _) => { if (ContextMenu.Items.Count == 0) Fill(ContextMenu); };
 
         // Panel rows follow the keyboard selection; peek rows (index -1) are never selected.

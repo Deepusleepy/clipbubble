@@ -185,6 +185,20 @@ static class Program
             Check(frame.PixelWidth == 3 && frame.PixelHeight == 2, $"size {frame.PixelWidth}x{frame.PixelHeight}");
         }),
 
+        ("an image copied by an app that only lists Bitmap is still read", () =>
+        {
+            var dib = Dib24(3, 2);
+            var snap = Capture.Read(new FakeClipboard(new[] { "Bitmap" }, f => f == DataFormats.Dib ? new MemoryStream(dib) : null));
+            Check(snap?.Dib != null && snap.Dib.Length == dib.Length, "DIB requested even though only Bitmap was listed");
+        }),
+
+        ("secrets marked by password managers are never read", () =>
+        {
+            Check(Capture.Read(new FakeClipboard(new[] { DataFormats.UnicodeText, Board.ExcludeFormat }, f => f == DataFormats.UnicodeText ? "pw" : null)) == null, "exclude marker");
+            Check(Capture.Read(new FakeClipboard(new[] { DataFormats.UnicodeText, "CanIncludeInClipboardHistory" }, f => f == DataFormats.UnicodeText ? "pw" : new MemoryStream(new byte[4]))) == null, "history opt-out");
+            Check(Capture.Read(new FakeClipboard(new[] { DataFormats.UnicodeText }, f => f == DataFormats.UnicodeText ? "hello" : null))?.Text == "hello", "plain text still read");
+        }),
+
         ("recorder: switched-off kinds aren't saved", () =>
         {
             Prefs.SetOn("text", false);
@@ -328,6 +342,23 @@ static class Program
             if (px[i + 3] > 200 && Math.Max(Math.Abs(px[i] - px[i + 1]), Math.Abs(px[i + 1] - px[i + 2])) > 60) return true;
         return false;
     }
+}
+
+/// A clipboard that lists `formats` but answers whatever `data` returns, like Windows synthesizing formats on request.
+sealed class FakeClipboard(string[] formats, Func<string, object?> data) : IDataObject
+{
+    public string[] GetFormats() => formats;
+    public string[] GetFormats(bool autoConvert) => formats;
+    public object? GetData(string format) => data(format);
+    public object? GetData(string format, bool autoConvert) => data(format);
+    public object? GetData(Type format) => null;
+    public bool GetDataPresent(string format) => data(format) != null;
+    public bool GetDataPresent(string format, bool autoConvert) => data(format) != null;
+    public bool GetDataPresent(Type format) => false;
+    public void SetData(object data) { }
+    public void SetData(string format, object data) { }
+    public void SetData(string format, object data, bool autoConvert) { }
+    public void SetData(Type format, object data) { }
 }
 
 /// Raw SQLite for fixtures and schema checks, outside the app's own Db.
