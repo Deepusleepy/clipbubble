@@ -15,11 +15,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: dotnet build Windows/Tests/ClipBubble.Tests.csproj -c Release -nologo
       - run: Windows/Tests/bin/Release/net48/ClipBubble.Tests.exe
       - run: Compress-Archive Windows/bin/Release/net48/ClipBubble.exe ClipBubble-Windows.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ClipBubble-Windows
           path: ClipBubble-Windows.zip
