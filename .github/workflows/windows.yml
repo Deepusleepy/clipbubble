@@ -1,0 +1,20 @@
+name: Windows
+
+on:
+  push:
+    paths: ['Windows/**', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['Windows/**', '.github/workflows/windows.yml']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: dotnet build Windows/Tests/ClipBubble.Tests.csproj -c Release -nologo
+      - run: Windows/Tests/bin/Release/net48/ClipBubble.Tests.exe
+      - run: Compress-Archive Windows/bin/Release/net48/ClipBubble.exe ClipBubble-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClipBubble-Windows
+          path: ClipBubble-Windows.zip
