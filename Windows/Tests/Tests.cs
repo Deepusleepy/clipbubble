@@ -430,7 +430,7 @@ static class Snapshots
     static FrameworkElement Framed(FrameworkElement view, double radius, double width, double height)
     {
         if (view.Parent is System.Windows.Controls.Panel old) old.Children.Remove(view);
-        var glass = Glass.Wrap(view, radius);
+        var glass = Glass.Wrap(view, radius, shadow: false);
         glass.Width = width;
         if (!double.IsNaN(height)) glass.Height = height;
         return glass;
@@ -445,18 +445,20 @@ static class Snapshots
         Dispatcher.PushFrame(frame);
     }
 
+    /// Hosted in an offscreen window, because the history list only creates rows once it's laid out in one.
     static void Save(FrameworkElement e, string path)
     {
-        e.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-        e.Arrange(new Rect(e.DesiredSize));
+        var host = new Window { Content = e, Left = -20000, Top = -20000, ShowActivated = false, ShowInTaskbar = false, WindowStyle = WindowStyle.None, SizeToContent = SizeToContent.WidthAndHeight };
+        host.Show();
         e.UpdateLayout();
-        Pump(0.2);
+        Pump(0.3);
         var rtb = new RenderTargetBitmap((int)Math.Ceiling(e.ActualWidth * 2), (int)Math.Ceiling(e.ActualHeight * 2), 192, 192, PixelFormats.Pbgra32);
         rtb.Render(e);
         var enc = new PngBitmapEncoder();
         enc.Frames.Add(BitmapFrame.Create(rtb));
-        using var f = File.Create(path);
-        enc.Save(f);
+        using (var f = File.Create(path)) enc.Save(f);
+        host.Content = null;
+        host.Close();
     }
 
     static byte[] Encode(BitmapSource b)

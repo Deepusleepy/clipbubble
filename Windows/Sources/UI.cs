@@ -533,13 +533,26 @@ sealed class FloatingWindow : Window
 /// with the hairline border drawn over the content like SwiftUI's strokeBorder overlay.
 static class Glass
 {
-    public static FrameworkElement Wrap(FrameworkElement content, double radius)
+    /// Room around the panel and peek for the drop shadow every macOS window has.
+    public const double Shadow = 24;
+
+    public static FrameworkElement Wrap(FrameworkElement content, double radius, bool shadow = true)
     {
-        var grid = new Grid();
+        var grid = new Grid { Margin = new Thickness(shadow ? Shadow : 0) };
+        if (shadow) grid.Children.Add(ShadowOf(new Border { CornerRadius = new CornerRadius(radius), Background = Brushes.Black }, 28, 8, 0.45));
         grid.Children.Add(new Border { CornerRadius = new CornerRadius(radius), Background = new SolidColorBrush(UI.Panel) });
         grid.Children.Add(content);
         grid.Children.Add(new Border { CornerRadius = new CornerRadius(radius), BorderBrush = UI.White(0.1), BorderThickness = new Thickness(1), IsHitTestVisible = false });
         return grid;
+    }
+
+    /// Cached as a bitmap, so the shadow isn't redrawn when the content above it changes.
+    public static T ShadowOf<T>(T element, double blur, double depth, double opacity) where T : UIElement
+    {
+        element.Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = blur, ShadowDepth = depth, Direction = 270, Opacity = opacity, Color = Colors.Black };
+        element.CacheMode = new BitmapCache();
+        element.IsHitTestVisible = false;
+        return element;
     }
 }
 
@@ -563,6 +576,7 @@ sealed class BubbleView : Grid
         this.model = model;
         Width = Height = 64;
         face = new Grid { Width = 46, Height = 46, RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = hoverScale };
+        face.Children.Add(Glass.ShadowOf(new Ellipse { Fill = Brushes.Black }, 10, 2, 0.35));
         face.Children.Add(new Ellipse { Fill = new SolidColorBrush(Color.FromArgb(0xE6, UI.Panel.R, UI.Panel.G, UI.Panel.B)) });
         ring = new Ellipse { Stroke = UI.AccentBrush, StrokeThickness = 2, Opacity = 0, RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = ringScale };
         face.Children.Add(ring);
@@ -637,12 +651,27 @@ sealed class BubbleView : Grid
 
 // MARK: - Rows
 
+sealed record RowItem(Clip Clip, int Index, bool Last, Model Model);
+
+/// What the lazy list creates for each visible item. The list's 6 pt padding lives on the first and last rows,
+/// so it scrolls with them as SwiftUI's does.
+sealed class RowHost : Decorator
+{
+    public RowHost() => DataContextChanged += (_, _) =>
+    {
+        if (DataContext is not RowItem r) { Child = null; return; }
+        Margin = new Thickness(6, r.Index == 0 ? 6 : 0, 6, r.Last ? 6 : 1);
+        Child = new Row(r.Clip, r.Index, r.Clip.Id == r.Model.Selection, r.Model);
+    };
+}
+
 /// One history item: tile, title, source and age, and the Ctrl+N hint for the first nine.
 sealed class Row : Border
 {
     readonly Clip clip;
     readonly Model model;
-    readonly bool selected;
+    bool selected;
+    TextBlock? hint;
     Point? down;
 
     public Row(Clip clip, int index, bool selected, Model model)
@@ -675,7 +704,7 @@ sealed class Row : Border
 
         if (index is >= 0 and < 9)
         {
-            var hint = UI.Label($"Ctrl+{index + 1}", 11, selected ? UI.Secondary : UI.Tertiary, FontWeights.Medium);
+            hint = UI.Label($"Ctrl+{index + 1}", 11, selected ? UI.Secondary : UI.Tertiary, FontWeights.Medium);
             hint.Margin = new Thickness(6, 0, 0, 0);
             hint.VerticalAlignment = VerticalAlignment.Center;
             Grid.SetColumn(hint, 2);
@@ -704,12 +733,29 @@ sealed class Row : Border
             down = null;
             model.Pick(clip, !Keyboard.Modifiers.HasFlag(ModifierKeys.Alt));
         };
-        ContextMenu = Menu();
+        // Built on first right-click: making a menu for every row up front costs more than the rows themselves.
+        ContextMenu = new ContextMenu();
+        ContextMenuOpening += (_, _) => { if (ContextMenu.Items.Count == 0) Fill(ContextMenu); };
+
+        // Panel rows follow the keyboard selection; peek rows (index -1) are never selected.
+        if (index < 0) return;
+        Action<string> follow = what => { if (what == nameof(Model.Selection)) Selected = clip.Id == model.Selection; };
+        Loaded += (_, _) => model.Changed += follow;
+        Unloaded += (_, _) => model.Changed -= follow;
     }
 
-    ContextMenu Menu()
+    bool Selected
     {
-        var menu = new ContextMenu();
+        set
+        {
+            selected = value;
+            Background = selected ? UI.White(0.12) : IsMouseOver ? UI.White(0.06) : Brushes.Transparent;
+            if (hint != null) hint.Foreground = selected ? UI.Secondary : UI.Tertiary;
+        }
+    }
+
+    void Fill(ContextMenu menu)
+    {
         void Add(string title, Action act) { var item = new MenuItem { Header = title }; item.Click += (_, _) => act(); menu.Items.Add(item); }
         Add("Paste", () => model.Pick(clip, true));
         Add("Copy", () => model.Pick(clip, false));
@@ -720,7 +766,6 @@ sealed class Row : Border
         }
         menu.Items.Add(new Separator());
         Add("Delete", () => model.Delete(clip));
-        return menu;
     }
 
     FrameworkElement? SourceIcon() => clip.Source switch
@@ -825,8 +870,7 @@ sealed class PanelView : Grid
     readonly Border clear;
     readonly StackPanel filters = new() { Orientation = Orientation.Horizontal };
     readonly Grid listArea = new();
-    readonly ScrollViewer scroll;
-    readonly StackPanel rows = new() { Margin = new Thickness(6) };
+    readonly ListBox list;
     readonly Grid main = new();
     readonly TranslateTransform lift = new();
     SettingsView? settings;
@@ -875,8 +919,8 @@ sealed class PanelView : Grid
         Add(filterRow, 1);
         Add(UI.Divider(), 2);
 
-        scroll = new ScrollViewer { Content = rows, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden, Focusable = false };
-        listArea.Children.Add(scroll);
+        list = LazyList();
+        listArea.Children.Add(list);
         Add(listArea, 3);
         Add(UI.Divider(), 4);
         Add(Footer(), 5);
@@ -887,13 +931,13 @@ sealed class PanelView : Grid
             switch (what)
             {
                 case nameof(Model.Clips): RenderRows(); break;
-                case nameof(Model.Selection): RenderRows(scrollToSelection: true); break;
+                case nameof(Model.Selection): Select(); break;
                 case nameof(Model.Filter): RenderFilters(); break;
                 case nameof(Model.Query):
                     if (search.Text != model.Query) search.Text = model.Query;
                     clear.Visibility = model.Query.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
                     break;
-                case nameof(Model.Previewing): RenderRows(); break;
+                case nameof(Model.Previewing): ShowPreview(); break;
                 case nameof(Model.ShowSettings):
                     if (model.ShowSettings) { settings = makeSettings(); Children.Add(settings); main.Visibility = Visibility.Hidden; }
                     else { if (settings != null) Children.Remove(settings); settings = null; main.Visibility = Visibility.Visible; search.Focus(); }
@@ -902,6 +946,7 @@ sealed class PanelView : Grid
             }
         };
         RenderFilters();
+        RenderRows();
     }
 
     void Add(UIElement e, int row) { Grid.SetRow(e, row); main.Children.Add(e); }
@@ -913,7 +958,29 @@ sealed class PanelView : Grid
         lift.Y = 6;
         UI.Spring(lift, TranslateTransform.YProperty, 0, 0.2, 0.9);
         RenderRows();
-        scroll.ScrollToTop();
+        if (list.Items.Count > 0) list.ScrollIntoView(list.Items[0]);
+    }
+
+    /// Only the rows on screen exist, like SwiftUI's LazyVStack: the list stays fast with a full week of history.
+    ListBox LazyList()
+    {
+        var box = new ListBox { Focusable = false, HorizontalContentAlignment = HorizontalAlignment.Stretch };
+        // Just a scroller and the rows: ListBox's own template adds a border and padding the Mac list doesn't have.
+        var scroller = new FrameworkElementFactory(typeof(ScrollViewer));
+        scroller.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, ScrollBarVisibility.Hidden);
+        scroller.SetValue(ScrollViewer.HorizontalScrollBarVisibilityProperty, ScrollBarVisibility.Disabled);
+        scroller.SetValue(ScrollViewer.CanContentScrollProperty, true);
+        scroller.SetValue(FocusableProperty, false);
+        scroller.AppendChild(new FrameworkElementFactory(typeof(ItemsPresenter)));
+        box.Template = new ControlTemplate(typeof(ListBox)) { VisualTree = scroller };
+        VirtualizingPanel.SetIsVirtualizing(box, true);
+        VirtualizingPanel.SetScrollUnit(box, ScrollUnit.Pixel);
+        var item = new Style(typeof(ListBoxItem));
+        item.Setters.Add(new Setter(Control.TemplateProperty, new ControlTemplate(typeof(ListBoxItem)) { VisualTree = new FrameworkElementFactory(typeof(ContentPresenter)) }));
+        item.Setters.Add(new Setter(FocusableProperty, false));
+        box.ItemContainerStyle = item;
+        box.ItemTemplate = new DataTemplate { VisualTree = new FrameworkElementFactory(typeof(RowHost)) };
+        return box;
     }
 
     void RenderFilters()
@@ -933,11 +1000,11 @@ sealed class PanelView : Grid
         }
     }
 
-    void RenderRows(bool scrollToSelection = false)
+    void RenderRows()
     {
         listArea.Children.Clear();
-        listArea.Children.Add(scroll);
-        rows.Children.Clear();
+        listArea.Children.Add(list);
+        list.ItemsSource = model.Clips.Select((c, i) => new RowItem(c, i, i == model.Clips.Count - 1, model)).ToList();
         if (model.Clips.Count == 0)
         {
             var empty = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
@@ -951,15 +1018,19 @@ sealed class PanelView : Grid
             listArea.Children.Add(empty);
             return;
         }
-        Row? selectedRow = null;
-        for (var i = 0; i < model.Clips.Count; i++)
-        {
-            var c = model.Clips[i];
-            var row = new Row(c, i, c.Id == model.Selection, model) { Margin = new Thickness(0, 0, 0, 1) };
-            if (c.Id == model.Selection) selectedRow = row;
-            rows.Children.Add(row);
-        }
-        if (scrollToSelection && selectedRow != null) selectedRow.BringIntoView();
+        ShowPreview();
+    }
+
+    /// Rows repaint their own highlight; the list only scrolls.
+    void Select()
+    {
+        if (list.ItemsSource is List<RowItem> items && items.FirstOrDefault(r => r.Clip.Id == model.Selection) is { } sel) list.ScrollIntoView(sel);
+        ShowPreview();
+    }
+
+    void ShowPreview()
+    {
+        foreach (var old in listArea.Children.OfType<PreviewPane>().ToList()) listArea.Children.Remove(old);
         if (model.Previewing && model.Selected is { } sel) listArea.Children.Add(new PreviewPane(sel));
     }
 
@@ -1421,12 +1492,12 @@ sealed class App : Application
         Snap(animated: false);
 
         panelView = new PanelView(model, () => new SettingsView(model, this));
-        panel = new FloatingWindow(420, 470, keyable: true) { Content = Glass.Wrap(panelView, 16) };
+        panel = new FloatingWindow(420 + 2 * Glass.Shadow, 470 + 2 * Glass.Shadow, keyable: true) { Content = Glass.Wrap(panelView, 16) };
         panel.Deactivated += (_, _) => { if (!modal) HidePanel(); };
         panel.PreviewKeyDown += HandleKey;
 
         var peekGlass = Glass.Wrap(new PeekView(model, () => HotkeyText), 14);
-        peek = new FloatingWindow(300, 100, keyable: false) { Content = peekGlass, SizeToContent = SizeToContent.Height };
+        peek = new FloatingWindow(300 + 2 * Glass.Shadow, 100, keyable: false) { Content = peekGlass, SizeToContent = SizeToContent.Height };
         peekGlass.MouseEnter += (_, _) => { peekHover = true; UpdatePeek(); };
         peekGlass.MouseLeave += (_, _) => { peekHover = false; UpdatePeek(); };
 
@@ -1798,13 +1869,13 @@ sealed class App : Application
         panel.Opacity = 0;
         panel.Show();
         var b = Win.Frame(bubble);
-        var p = Win.Frame(panel);
+        var p = Card(panel);
         var area = Win.WorkArea(new Win.POINT { X = (b.Left + b.Right) / 2, Y = (b.Top + b.Bottom) / 2 });
         var s = Win.Scale(bubble);
         int pw = p.Right - p.Left, ph = p.Bottom - p.Top, edge = (int)(8 * s), inset = (int)(9 * s), lap = (int)(4 * s);
         var x = (b.Left + b.Right) / 2 > (area.Left + area.Right) / 2 ? b.Right - pw - inset : b.Left + inset;
         var y = (b.Top + b.Bottom) / 2 < (area.Top + area.Bottom) / 2 ? b.Bottom - lap : b.Top - ph + lap;
-        Win.Move(panel, Math.Min(Math.Max(x, area.Left + edge), area.Right - pw - edge), Math.Min(Math.Max(y, area.Top + edge), area.Bottom - ph - edge));
+        MoveCard(panel, Math.Min(Math.Max(x, area.Left + edge), area.Right - pw - edge), Math.Min(Math.Max(y, area.Top + edge), area.Bottom - ph - edge));
         panel.Activate();
         model.Shown();
         UI.Fade(panel, 1, 0.1);
@@ -1835,13 +1906,27 @@ sealed class App : Application
     void PlacePeek()
     {
         var b = Win.Frame(bubble);
-        var p = Win.Frame(peek);
+        var p = Card(peek);
         var area = Win.WorkArea(new Win.POINT { X = (b.Left + b.Right) / 2, Y = (b.Top + b.Bottom) / 2 });
         var s = Win.Scale(bubble);
         int pw = p.Right - p.Left, ph = p.Bottom - p.Top, edge = (int)(8 * s), gap = (int)(4 * s), inset = (int)(9 * s);
         var x = (b.Left + b.Right) / 2 > (area.Left + area.Right) / 2 ? b.Left - pw - gap : b.Right + gap;
         var y = (b.Top + b.Bottom) / 2 < (area.Top + area.Bottom) / 2 ? b.Top + inset : b.Bottom - inset - ph;
-        Win.Move(peek, Math.Min(Math.Max(x, area.Left + edge), area.Right - pw - edge), Math.Min(Math.Max(y, area.Top + edge), area.Bottom - ph - edge));
+        MoveCard(peek, Math.Min(Math.Max(x, area.Left + edge), area.Right - pw - edge), Math.Min(Math.Max(y, area.Top + edge), area.Bottom - ph - edge));
+    }
+
+    /// The visible panel or peek inside its window, without the shadow margin, in physical pixels.
+    static Win.RECT Card(Window w)
+    {
+        var f = Win.Frame(w);
+        var m = (int)Math.Round(Glass.Shadow * Win.Scale(w));
+        return new Win.RECT { Left = f.Left + m, Top = f.Top + m, Right = f.Right - m, Bottom = f.Bottom - m };
+    }
+
+    static void MoveCard(Window w, int x, int y)
+    {
+        var m = (int)Math.Round(Glass.Shadow * Win.Scale(w));
+        Win.Move(w, x - m, y - m);
     }
 
     void ShowPeek()
