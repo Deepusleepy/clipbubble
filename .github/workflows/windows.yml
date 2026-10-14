@@ -5,10 +5,14 @@ on:
     paths: ['Windows/**', '.github/workflows/windows.yml']
   pull_request:
     paths: ['Windows/**', '.github/workflows/windows.yml']
+  release:
+    types: [published]
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - run: dotnet build Windows/Tests/ClipBubble.Tests.csproj -c Release -nologo
@@ -18,3 +22,8 @@ jobs:
         with:
           name: ClipBubble-Windows
           path: ClipBubble-Windows.zip
+      # Publishing a release (from the Mac, as usual) attaches the Windows build to it.
+      - if: github.event_name == 'release'
+        run: gh release upload "${{ github.event.release.tag_name }}" ClipBubble-Windows.zip --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
