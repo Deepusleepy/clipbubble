@@ -54,7 +54,7 @@ sealed class Model
 
     public Action<Clip, bool> Pick = (_, _) => { };
     public Action PrefsChanged = () => { };
-    /// Bumps on every open: refocuses search and refreshes relative times.
+    /// Raised when the panel opens, after Reset has reloaded it: refocuses search and scrolls to the top.
     public void Shown() => Raise(Change.Shown);
 
     public Clip? Selected => Clips.FirstOrDefault(c => c.Id == Selection) ?? Clips.FirstOrDefault();
