@@ -916,7 +916,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showPeek() {
-        guard !peek.isVisible else { return }
+        // Re-check at show time: a click may have opened the panel while this was scheduled.
+        guard !peek.isVisible, !panel.isVisible, !dragging, model.bubbleHover || model.peekHover else { return }
+        model.reloadRecent()
         model.shown += 1
         model.unseen = 0
         resizePeek()
