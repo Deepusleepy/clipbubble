@@ -157,7 +157,7 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
         {
             case "clipboard_history":
                 Prefs.Reload();
-                var clips = db.Clips(limit: (int)Math.Min(Int(a.GetValueOrDefault("limit")) ?? 20, 100), kind: Store.ParseKind(S("kind")),
+                var clips = db.Clips(limit: (int)Math.Max(1, Math.Min(Int(a.GetValueOrDefault("limit")) ?? 20, 100)), kind: Store.ParseKind(S("kind")),
                                      source: S("source"), query: S("query"), sinceHours: Number(a.GetValueOrDefault("since_hours")));
                 if (clips.Count == 0) return Text("No clipboard items match.");
                 return Text(string.Join("\n\n", clips.Select(c => Header(c) + "\n" + (c.Kind == ClipKind.Image ? c.File ?? "" : Prefix(c.Text, 300)))));

@@ -70,21 +70,25 @@ static class Store
     {
         try
         {
-            static byte[] Pixels(Func<Stream> open, out int w, out int h)
+            static (int, int) Size(Func<Stream> open)
+            {
+                using var s = open();
+                var frame = BitmapDecoder.Create(s, BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.None).Frames[0];
+                return (frame.PixelWidth, frame.PixelHeight);
+            }
+            static byte[] Pixels(Func<Stream> open)
             {
                 using var s = open();
                 var frame = new FormatConvertedBitmap(BitmapDecoder.Create(s, BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad).Frames[0],
                     System.Windows.Media.PixelFormats.Bgra32, null, 0);
-                (w, h) = (frame.PixelWidth, frame.PixelHeight);
-                var px = new byte[w * h * 4];
-                frame.CopyPixels(px, w * 4, 0);
+                var px = new byte[frame.PixelWidth * frame.PixelHeight * 4];
+                frame.CopyPixels(px, frame.PixelWidth * 4, 0);
                 return px;
             }
-            var pa = Pixels(a, out var wa, out var ha);
-            var pb = Pixels(b, out var wb, out var hb);
-            return wa == wb && ha == hb && pa.SequenceEqual(pb);
+            // Comparing sizes reads only the headers; the full decode runs only for a likely match.
+            return Size(a) == Size(b) && Pixels(a).SequenceEqual(Pixels(b));
         }
-        catch (Exception e) when (e is NotSupportedException or FileFormatException or ArgumentException or IOException or UnauthorizedAccessException) { return false; }
+        catch (Exception e) when (e is NotSupportedException or FileFormatException or ArgumentException or IOException or UnauthorizedAccessException or OutOfMemoryException) { return false; }
     }
 
     public static Stream OpenShared(string path) => new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -125,12 +129,13 @@ sealed class Db : IDisposable
         Directory.CreateDirectory(Paths.Images);
         if (sqlite3_open16(Paths.Db, out h) != 0) throw new IOException("Can't open " + Paths.Db);
         sqlite3_busy_timeout(h, 3000);
-        sqlite3_exec(h, Encoding.UTF8.GetBytes(@"
+        var rc = sqlite3_exec(h, Encoding.UTF8.GetBytes(@"
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS clips(
               id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
               file TEXT, source TEXT NOT NULL DEFAULT '', hash TEXT UNIQUE NOT NULL, created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS clips_created ON clips(created);" + "\0"), IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (rc != 0) throw new IOException($"Can't set up {Paths.Db}: " + Marshal.PtrToStringUni(sqlite3_errmsg16(h)));
     }
 
     public void Dispose() => sqlite3_close_v2(h);

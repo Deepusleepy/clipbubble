@@ -432,9 +432,9 @@ static unsafe class Glyphs
     public static BitmapSource? Load(string path, double size) => Cached($"f|{size}|{path}|{SafeStamp(path)}", () =>
     {
         if (!File.Exists(path)) return null;
-        if (path.EndsWith(".svg", StringComparison.OrdinalIgnoreCase)) return DrawSvg(File.ReadAllBytes(path), (int)(size * Scale));
         try
         {
+            if (path.EndsWith(".svg", StringComparison.OrdinalIgnoreCase)) return DrawSvg(File.ReadAllBytes(path), (int)(size * Scale));
             var img = BitmapFrame.Create(new Uri(path), BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad);
             img.Freeze();
             return img;

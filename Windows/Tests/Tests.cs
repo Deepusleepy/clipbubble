@@ -228,6 +228,15 @@ static class Program
             Check(Capture.Read(new FakeClipboard(new[] { DataFormats.UnicodeText }, f => f == DataFormats.UnicodeText ? "hello" : null))?.Text == "hello", "plain text still read");
         }),
 
+        ("MCP history keeps its 1 to 100 limit for any number", () =>
+        {
+            using var db = new Db();
+            for (var i = 0; i < 3; i++) db.Upsert(ClipKind.Text, "item " + i, null, "Notepad", "t:limit" + i);
+            string History(object limit) => (string)((Dictionary<string, object>)((object[])ClipBubble.Mcp.Call(db, "clipboard_history", new Dictionary<string, object?> { ["limit"] = limit })["content"])[0])["text"];
+            Check(History(-1).Split(new[] { "\n\n" }, StringSplitOptions.None).Length == 1, "negative limit gives one item, not everything");
+            Check(History(2).Split(new[] { "\n\n" }, StringSplitOptions.None).Length == 2, "normal limit");
+        }),
+
         ("recorder: switched-off kinds aren't saved", () =>
         {
             Prefs.SetOn("text", false);
