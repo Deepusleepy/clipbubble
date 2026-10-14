@@ -48,7 +48,10 @@ git clone https://github.com/rohit3a/clipbubble && cd clipbubble && ./build.sh
 
 `build.sh` compiles the app, installs it to `~/Applications` and launches it. Requires macOS 14 or later.
 
-**Permissions:** macOS asks for access to your screenshots folder (usually Desktop) and Downloads so those land in history. Auto-paste needs **Accessibility** access (System Settings → Privacy & Security → Accessibility); without it, picking an item just copies it.
+**Permissions:** Settings (⚙ in the panel) → **Folders & permissions** shows each one live, with a switch and a **Fix** button that opens the right page in System Settings:
+- **Screenshots:** ClipBubble watches the folder from your macOS screenshot setting (⌘⇧5 → Options → Save to), and notices when you change it. You can also pick a different folder.
+- **Recent downloads:** your Downloads folder.
+- **Auto-paste:** needs Accessibility access. Without it (or with it switched off), picking an item just copies it.
 
 ## Keys
 

@@ -542,6 +542,12 @@ struct SettingsView: View {
     @State private var copyShots = UserDefaults.standard.bool(forKey: "copyScreenshots")
     @State private var openAtLogin = SMAppService.mainApp.status == .enabled
     @State private var promptCopied = false
+    @State private var autoPaste = UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true
+    @State private var shotsOK: Bool?
+    @State private var dlOK: Bool?
+    @State private var axOK: Bool?
+    private let ticker = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    private var customShots: Bool { _ = model.prefsTick; return !(UserDefaults.standard.string(forKey: "screenshotFolder") ?? "").isEmpty }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -563,7 +569,7 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     section("Save to history") {
-                        ForEach(Prefs.categories, id: \.key) { c in
+                        ForEach(Prefs.categories.filter { !["screenshots", "downloads"].contains($0.key) }, id: \.key) { c in
                             toggleRow(c.icon, c.title, c.detail, isOn: Binding(
                                 get: { _ = model.prefsTick; return Prefs.on(c.key) },
                                 set: { model.setPref(c.key, $0) }))
@@ -571,8 +577,24 @@ struct SettingsView: View {
                         Text("Turning one off stops saving it and hides what's already there, for your agents too.")
                             .font(.system(size: 10.5)).foregroundStyle(.tertiary).padding(.top, 2)
                     }
-                    section("Screenshots") {
-                        toggleRow("doc.on.clipboard", "Also copy them to the clipboard", "So a new screenshot is ready to paste", isOn: $copyShots)
+                    section("Folders & permissions") {
+                        permRow("camera.viewfinder", "Screenshots", folder: FolderWatcher.screenshotFolder,
+                                note: customShots ? "Folder you picked" : "From your macOS screenshot setting",
+                                ok: shotsOK, isOn: pref("screenshots"), fix: openFilesSettings) {
+                            HStack(spacing: 12) {
+                                Button("Change folder…", action: pickShotsFolder)
+                                if customShots { Button("Use macOS setting") { UserDefaults.standard.removeObject(forKey: "screenshotFolder"); model.setPref("screenshots", true) } }
+                            }
+                            .buttonStyle(.link).font(.system(size: 11))
+                            Toggle("Also copy new ones to the clipboard", isOn: $copyShots)
+                                .toggleStyle(.checkbox).font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                        permRow("arrow.down.circle", "Recent downloads", folder: FolderWatcher.downloadsFolder, note: nil,
+                                ok: dlOK, isOn: pref("downloads"), fix: openFilesSettings) { EmptyView() }
+                        permRow("keyboard", "Auto-paste", folder: nil, note: "↩ pastes into the app you were in. Needs Accessibility access.",
+                                ok: autoPaste ? axOK : nil, isOn: $autoPaste, fix: openAccessibilitySettings) { EmptyView() }
+                        Text("macOS doesn't let apps change these themselves. Switching one on asks for access; if it was blocked, Fix opens the right page in System Settings.")
+                            .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true).padding(.top, 2)
                     }
                     section("Mascot") {
                         LazyVGrid(columns: Array(repeating: GridItem(.fixed(44), spacing: 8), count: 7), alignment: .leading, spacing: 8) {
@@ -616,16 +638,6 @@ struct SettingsView: View {
                     }
                     section("General") {
                         toggleRow("power", "Open at login", nil, isOn: $openAtLogin)
-                        if !AXIsProcessTrusted() {
-                            Button {
-                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                            } label: {
-                                row("keyboard", "Turn on auto-paste", "Needs Accessibility access") {
-                                    Image(systemName: "arrow.up.forward").font(.system(size: 11)).foregroundStyle(.secondary)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
                         HStack {
                             Button("Clear all history…", action: clearAll)
                             Spacer()
@@ -638,10 +650,84 @@ struct SettingsView: View {
             }
             .scrollIndicators(.never)
         }
+        .onAppear(perform: refresh)
+        .onReceive(ticker) { _ in refresh() }   // picks up changes made in System Settings
+        .onChange(of: model.prefsTick) { refresh() }
+        .onChange(of: autoPaste) { _, on in
+            UserDefaults.standard.set(on, forKey: "autoPaste")
+            if on && !AXIsProcessTrusted() {
+                AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+            }
+            refresh()
+        }
         .onChange(of: copyShots) { _, on in UserDefaults.standard.set(on, forKey: "copyScreenshots") }
         .onChange(of: openAtLogin) { _, on in
             try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
         }
+    }
+
+    private func pref(_ key: String) -> Binding<Bool> {
+        Binding(get: { _ = model.prefsTick; return Prefs.on(key) }, set: { model.setPref(key, $0) })
+    }
+
+    private func refresh() {
+        shotsOK = Prefs.on("screenshots") ? FolderWatcher.canRead(FolderWatcher.screenshotFolder) : nil
+        dlOK = Prefs.on("downloads") ? FolderWatcher.canRead(FolderWatcher.downloadsFolder) : nil
+        axOK = AXIsProcessTrusted()
+    }
+
+    private func openFilesSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")!)
+    }
+
+    private func openAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
+    private func pickShotsFolder() {
+        model.dismiss()
+        NSApp.activate(ignoringOtherApps: true)
+        let open = NSOpenPanel()
+        open.canChooseDirectories = true
+        open.canChooseFiles = false
+        open.directoryURL = FolderWatcher.screenshotFolder
+        open.message = "Pick the folder ClipBubble should watch for screenshots."
+        guard open.runModal() == .OK, let url = open.url else { return }
+        UserDefaults.standard.set(url.path, forKey: "screenshotFolder")
+        model.setPref("screenshots", true)
+    }
+
+    /// A feature that needs a folder or permission: switch, where it looks, and whether macOS lets it.
+    private func permRow<X: View>(_ icon: String, _ title: String, folder: URL?, note: String?, ok: Bool?,
+                                  isOn: Binding<Bool>, fix: @escaping () -> Void, @ViewBuilder extra: () -> X) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon).font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20).padding(.top, 1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.system(size: 13, weight: .medium))
+                if let folder {
+                    Text((folder.path as NSString).abbreviatingWithTildeInPath)
+                        .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                if let note { Text(note).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                HStack(spacing: 6) {
+                    switch ok {
+                    case .some(true):
+                        Label("Allowed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    case .some(false):
+                        Label("No access", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        Button("Fix", action: fix).buttonStyle(.link)
+                    case .none:
+                        Label("Off", systemImage: "minus.circle").foregroundStyle(.tertiary)
+                    }
+                }
+                .font(.system(size: 11, weight: .medium)).labelStyle(.titleAndIcon)
+                extra()
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: isOn).toggleStyle(.switch).controlSize(.mini).labelsHidden()
+        }
+        .padding(.vertical, 6)
     }
 
     private func section<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
@@ -773,7 +859,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var peek: FloatingPanel!
     private var peekHost: NSView!
     private var capture: Capture!
-    private var screenshots: FolderWatcher!
+    private var screenshots: FolderWatcher?
     private var downloads: FolderWatcher?
     private var clickMonitor: Any?
     private var keyMonitor: Any?
@@ -828,15 +914,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.hoverChanged = { [weak self] in self?.updatePeek() }
 
         capture = Capture { [weak self] in DispatchQueue.main.async { self?.captured() } }
-        // Every screenshot lands in history; copying it to the clipboard as well is optional.
-        screenshots = FolderWatcher(folder: FolderWatcher.screenshotFolder, maxAge: 120,
-                                    include: { isImagePath($0.path) || ["mov", "mp4"].contains($0.pathExtension.lowercased()) }) { [weak self] url, date in
-            guard Prefs.on("screenshots") else { return }
-            self?.model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: "f:" + sha(url.path), created: date)
-            if UserDefaults.standard.bool(forKey: "copyScreenshots") { Board.writeFiles([url]) } else { self?.captured() }
-        }
+        syncScreenshots()
         syncDownloads()
-        model.prefsChanged = { [weak self] in self?.syncDownloads(); self?.importFolders() }
+        model.prefsChanged = { [weak self] in self?.syncScreenshots(); self?.syncDownloads(); self?.importFolders() }
+        // Notice when the screenshot location changes in ⌘⇧5 → Options.
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            guard let self, self.screenshots?.folder != FolderWatcher.screenshotFolder else { return }
+            self.syncScreenshots()
+            self.importFolders()
+        }
         importFolders()
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.importFolders() }
         Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
@@ -854,10 +940,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKey()
     }
 
+    /// Every screenshot lands in history; copying it to the clipboard as well is optional.
+    private func syncScreenshots() {
+        let folder = FolderWatcher.screenshotFolder
+        guard Prefs.on("screenshots") else { screenshots?.stop(); screenshots = nil; return }
+        guard screenshots?.folder != folder else { return }
+        screenshots?.stop()
+        screenshots = FolderWatcher(folder: folder, maxAge: 120,
+                                    include: { isImagePath($0.path) || ["mov", "mp4"].contains($0.pathExtension.lowercased()) }) { [weak self] url, date in
+            self?.model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: "f:" + sha(url.path), created: date)
+            if UserDefaults.standard.bool(forKey: "copyScreenshots") { Board.writeFiles([url]) } else { self?.captured() }
+        }
+    }
+
     /// Watches ~/Downloads only while that's switched on (so the privacy prompt only shows up if you want it).
     private func syncDownloads() {
         if Prefs.on("downloads") {
-            guard downloads == nil, let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return }
+            guard downloads == nil, let dir = FolderWatcher.downloadsFolder else { return }
             downloads = FolderWatcher(folder: dir, maxAge: nil,
                                       include: { !FolderWatcher.tempExts.contains($0.pathExtension.lowercased()) }) { [weak self] url, date in
                 self?.model.db.insertIfMissing(kind: "file", text: url.path, source: "Downloads", hash: "f:" + sha(url.path), created: date)
@@ -871,7 +970,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Backfills the last 7 days of screenshots and downloads. Cheap and idempotent, so it also reruns after access is granted.
     private func importFolders() {
-        if Prefs.on("screenshots") {
+        if let screenshots {
             for (url, date) in screenshots.existing(days: 7) {
                 model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: "f:" + sha(url.path), created: date)
             }
@@ -916,7 +1015,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Board.write(c)
         hidePanel()
         hidePeek()
-        guard paste else { return }
+        guard paste, UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true else { return }
         guard AXIsProcessTrusted() else {
             if !askedForAccessibility {
                 askedForAccessibility = true

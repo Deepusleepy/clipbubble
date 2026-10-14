@@ -96,9 +96,24 @@ final class Capture {
 /// Watches a folder (screenshots, Downloads) and hands each new item that passes `include` to `onNew`.
 final class FolderWatcher {
     static let tempExts: Set<String> = ["crdownload", "download", "part", "partial", "tmp", "opdownload", "icloud"]
-    static var screenshotFolder: URL {
+    /// Where macOS saves screenshots (⌘⇧5 → Options → Save to), or the Desktop if that's never been set.
+    static var macOSScreenshotFolder: URL {
         let raw = UserDefaults(suiteName: "com.apple.screencapture")?.string(forKey: "location") ?? "~/Desktop"
         return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
+    }
+    /// A folder picked in Settings wins over the macOS setting.
+    static var screenshotFolder: URL {
+        if let custom = UserDefaults.standard.string(forKey: "screenshotFolder"), !custom.isEmpty {
+            return URL(fileURLWithPath: custom, isDirectory: true)
+        }
+        return macOSScreenshotFolder
+    }
+    static var downloadsFolder: URL? { FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first }
+
+    /// Whether we can read the folder (asks macOS the first time, which may show its privacy prompt).
+    static func canRead(_ url: URL?) -> Bool {
+        guard let url else { return false }
+        return (try? FileManager.default.contentsOfDirectory(atPath: url.path)) != nil
     }
 
     let folder: URL
