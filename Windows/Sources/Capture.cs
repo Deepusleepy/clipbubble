@@ -39,15 +39,15 @@ sealed class Writer
     /// Waits for everything queued so far, up to `timeout`.
     public bool Finish(TimeSpan timeout) => chain.Wait(timeout);
 
-    /// A delete or cleanup. `then` runs on the UI thread even if it failed (and is told whether it did), so a view
-    /// that re-reads shows what's really stored.
-    public void Write(Action<Db> write, Action<bool>? then = null)
+    /// A delete or cleanup. `then` runs on the UI thread even if it failed (and gets the error), so a view that
+    /// re-reads shows what's really stored.
+    public void Write(Action<Db> write, Action<Exception?>? then = null)
     {
-        var failed = false;
+        Exception? failed = null;
         Run(() =>
         {
             try { write(Db); }
-            catch (Exception e) { Log.Error(e); failed = true; }
+            catch (Exception e) { Log.Error(e); failed = e; }
             return true;
         }, () => then?.Invoke(failed));
     }

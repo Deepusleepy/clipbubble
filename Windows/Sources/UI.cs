@@ -139,17 +139,20 @@ sealed class Model
         {
             deleting.Remove(c.Id);
             Refresh();
-            if (failed) ShowError("Couldn't delete that", Busy);
+            if (failed is { } e) ShowError("Couldn't delete that", Why(e));
         });
     }
 
     public void ClearAll() => Writer.Write(db => { Forgotten.ClearAll(); db.DeleteAll(); }, failed =>
     {
         Refresh();
-        if (failed) ShowError("Couldn't clear history", Busy);
+        if (failed is { } e) ShowError("Couldn't clear history", Why(e));
     });
 
-    const string Busy = "Another app is using ClipBubble's history right now. Try again in a moment.";
+    /// SQLite reports a database another process holds as busy or locked; anything else (a full disk) is said as is.
+    static string Why(Exception e) => e.Message.Contains("locked") || e.Message.Contains("busy")
+        ? "Another app is using ClipBubble's history right now. Try again in a moment."
+        : e.Message;
 
     public void Refresh()
     {
@@ -183,16 +186,16 @@ static class Thumbs
     {
         var key = (path, px);
         if (Cache.TryGetValue(key, out var hit)) { done(hit); return; }
-        if (Failed.TryGetValue(key, out var failed) && failed == Version(path)) { done(null); return; }
         if (Pending.TryGetValue(key, out var waiting)) { waiting.Add(done); return; }
         Pending[key] = new List<Action<BitmapSource?>> { done };
+        (long, DateTime)? failed = Failed.TryGetValue(key, out var f) ? f : null;
         var dispatcher = Dispatcher.CurrentDispatcher;
         Task.Run(() =>
         {
             BitmapSource? img = null;
             Size? dims = null;
-            var version = Version(path);
-            try { (img, dims) = Store.DecodeFit(path, px); }
+            var version = Version(path);   // here, not on the UI thread: a network drive can take a while to answer
+            try { if (version != failed) (img, dims) = Store.DecodeFit(path, px); }
             catch (Exception e)
             {
                 // Whatever failed, the callbacks below still run; otherwise this picture would stay blank until a restart.
@@ -444,6 +447,19 @@ static unsafe class Shell
     static readonly Dictionary<string, List<Action<BitmapSource?>>> Pending = new();
     static readonly BlockingCollection<Action> Work = new();
     static readonly List<Worker> Workers = new();
+    /// While icons are waiting: every 2 s, if every icon thread is stuck, another one starts (the first one too).
+    static readonly DispatcherTimer Unstick = Watchdog();
+
+    static DispatcherTimer Watchdog()
+    {
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+        timer.Tick += (_, _) =>
+        {
+            if (Pending.Count == 0) { timer.Stop(); return; }
+            if (Workers.All(w => w.Stuck)) Workers.Add(new Worker());
+        };
+        return timer;
+    }
     static readonly Guid IID_IShellItemImageFactory = new("bcc18b79-ba16-442f-80c4-8a59c30c463b");
 
     /// One icon thread, and when a third-party icon handler hangs it, another, so the icons queued behind still come.
@@ -475,7 +491,8 @@ static unsafe class Shell
         if (Cache.TryGetValue(key, out var hit)) { done(hit); return; }
         if (Pending.TryGetValue(key, out var waiting)) { waiting.Add(done); return; }
         Pending[key] = new List<Action<BitmapSource?>> { done };
-        if (Workers.All(w => w.Stuck)) Workers.Add(new Worker());
+        if (Workers.Count == 0) Workers.Add(new Worker());
+        Unstick.Start();
         var ui = Dispatcher.CurrentDispatcher;
         Work.Add(() =>
         {

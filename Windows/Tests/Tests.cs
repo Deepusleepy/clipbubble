@@ -423,7 +423,6 @@ static class Program
             Thumbs.Load(broken, 64, _ => calls++);
             Snapshots.Pump(1);
             Thumbs.Load(broken, 64, _ => calls++);
-            Check(calls == 2, "the same broken file isn't decoded again: answered at once");
             Snapshots.Pump(1);
             Check(calls == 2, $"{calls} of 2 callbacks ran; a stuck decode leaves the row blank until a restart");
         }),
@@ -509,8 +508,8 @@ static class Program
         {
             using (var db = new Db()) db.Upsert(ClipKind.Text, "stuck", null, "Notepad", "t:stuck");
             var model = new Model();
-            string? error = null;
-            model.ShowError = (title, _) => error = title;
+            string? error = null, detail = null;
+            model.ShowError = (title, why) => (error, detail) = (title, why);
             model.Refresh();
             using (Sql.Hold(Paths.Db, "BEGIN IMMEDIATE"))
             {
@@ -520,6 +519,7 @@ static class Program
             }
             Check(model.Clips.Count == 1 && model.Recent.Count == 1, "back in the list, because it's still stored");
             Check(error == "Couldn't delete that", "and says so: " + error);
+            Check(detail?.StartsWith("Another app is using") == true, "a locked database is put in plain words: " + detail);
         }),
 
         ("a setting that can't be saved stays as it was and says why", () =>
