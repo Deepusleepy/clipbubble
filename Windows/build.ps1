@@ -12,9 +12,14 @@ New-Item -ItemType Directory -Force $dest | Out-Null
 # Those servers keep the old exe open. Windows can't overwrite it but can rename it, so it moves aside; old copies
 # go once no server uses them.
 Get-ChildItem $dest -Filter 'ClipBubble.*.old' | Remove-Item -ErrorAction SilentlyContinue
+$old = Join-Path $dest "ClipBubble.$([guid]::NewGuid().ToString('N').Substring(0, 8)).old"
 if (Test-Path $exe) {
-    try { Move-Item $exe (Join-Path $dest "ClipBubble.$([guid]::NewGuid().ToString('N').Substring(0, 8)).old") }
+    try { Move-Item $exe $old }
     catch { Start-Process $exe; throw }   # couldn't swap it: the app comes back as it was
 }
-Copy-Item bin\Release\net48\ClipBubble.exe $dest
+try { Copy-Item bin\Release\net48\ClipBubble.exe $dest }
+catch {
+    if (Test-Path $old) { Move-Item $old $exe -Force; Start-Process $exe }   # couldn't copy the new one: the old one goes back
+    throw
+}
 Start-Process $exe

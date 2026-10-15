@@ -352,11 +352,13 @@ sealed class FolderWatcher : IDisposable
     /// keeps watching a renamed folder under its new name and says nothing.
     readonly DispatcherTimer check = new() { Interval = TimeSpan.FromSeconds(5) };
     DateTime watchedCreated;
-    /// Null until the folder could be listed once. Until then only files created after the watcher started count as new,
+    /// Null until the folder could be listed once. Until then only files created after `since` count as new,
     /// so a folder that appears later (Snipping Tool's first save) reports its new screenshot, while one that was
     /// missing or unreadable for a while (an unplugged drive) doesn't report everything already in it.
     HashSet<string>? known;
-    readonly DateTime started = DateTime.Now;
+    /// Files created after this count as new while `known` is null: when the watcher started, and later the last time
+    /// the 5 s check saw the folder fine (so a folder restored days later doesn't announce what was already there).
+    DateTime since = DateTime.Now;
     FileSystemWatcher? watcher;
     bool stopped;
 
@@ -391,7 +393,7 @@ sealed class FolderWatcher : IDisposable
         check.Start();
         if (!Directory.Exists(Folder)) return;
         // A different folder than last time (renamed and made again, deleted and restored): its files aren't new,
-        // except ones made since this watcher started. A date that can't be read is taken as the same folder.
+        // except ones made since it was last seen fine. A date that can't be read is taken as the same folder.
         var created = Created(Folder);
         if (watchedCreated != default && created != DateTime.MinValue && created != watchedCreated) known = null;
         if (created != DateTime.MinValue) watchedCreated = created;
@@ -418,7 +420,7 @@ sealed class FolderWatcher : IDisposable
     {
         if (checking) return;
         checking = true;
-        var (dispatcher, watching, created) = (Dispatcher.CurrentDispatcher, watcher != null, watchedCreated);
+        var (dispatcher, watching, created, probed) = (Dispatcher.CurrentDispatcher, watcher != null, watchedCreated, DateTime.Now);
         Task.Run(() =>
         {
             var exists = Directory.Exists(Folder);
@@ -429,8 +431,9 @@ sealed class FolderWatcher : IDisposable
             {
                 checking = false;
                 if (stopped) return;
-                if (restart) Restart();
-                else if (watchedCreated == default && now != DateTime.MinValue) watchedCreated = now;   // its date became readable
+                if (restart) { Restart(); return; }
+                if (watching && exists) since = probed;
+                if (watchedCreated == default && now != DateTime.MinValue) watchedCreated = now;   // its date became readable
             }));
         });
     }
@@ -476,7 +479,7 @@ sealed class FolderWatcher : IDisposable
     void Scan()
     {
         if (stopped || Listing() is not { } now) return;
-        var fresh = now.Where(p => known == null ? Added(p) >= started : !known.Contains(p)).ToList();
+        var fresh = now.Where(p => known == null ? Added(p) >= since : !known.Contains(p)).ToList();
         known = new HashSet<string>(now);
         DateTime? cutoff = maxAge.HasValue ? DateTime.Now.AddSeconds(-maxAge.Value) : null;
         foreach (var path in fresh.OrderBy(Added))

@@ -368,11 +368,16 @@ sealed class Db : IDisposable
     /// folders, can't be read, so the folder import waits rather than bringing those files back.
     public bool ImportLegacyForgotten(IEnumerable<string?> folders)
     {
+        try { return MoveLegacyForgotten(folders); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }   // tried again next time
+    }
+
+    bool MoveLegacyForgotten(IEnumerable<string?> folders)
+    {
         var json = Path.Combine(Paths.Dir, "forgotten.json");
         if (!System.IO.File.Exists(json)) return true;
         Dictionary<string, object?> old;
         try { old = Store.Json.Deserialize<Dictionary<string, object?>>(Store.ReadText(json)) ?? new(); }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException) { old = new(); }   // not JSON: nothing to keep
         static double Seconds(object? ms)
         {
@@ -393,13 +398,9 @@ sealed class Db : IDisposable
             foreach (var folder in folders.Where(f => f != null))
             {
                 if (!Directory.Exists(folder)) { missing = true; continue; }
-                try
-                {
-                    foreach (var entry in new DirectoryInfo(folder!).EnumerateFileSystemInfos())
-                        if (new DateTimeOffset(entry.CreationTime).ToUnixTimeMilliseconds() / 1000.0 <= clearedAt && !removed.ContainsKey(entry.FullName))
-                            removed[entry.FullName] = clearedAt;
-                }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }
+                foreach (var entry in new DirectoryInfo(folder!).EnumerateFileSystemInfos())
+                    if (new DateTimeOffset(entry.CreationTime).ToUnixTimeMilliseconds() / 1000.0 <= clearedAt && !removed.ContainsKey(entry.FullName))
+                        removed[entry.FullName] = clearedAt;
             }
         foreach (var r in removed) Run("INSERT OR REPLACE INTO forgotten(hash, at) VALUES(?, ?)", "f:" + Store.Sha(r.Key), r.Value);
         if (!missing || clearedAt < Now - Retention) System.IO.File.Delete(json);
