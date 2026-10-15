@@ -474,6 +474,7 @@ static class Program
             Check(Paste(() => false, () => true, () => { sent++; return true; }, timeout: 0.2) is { } late && late.Contains("Ctrl+V") && sent == 0, "app never came back: no paste, and press Ctrl+V");
             Check(watch.Elapsed.TotalSeconds < 1, $"gave up after {watch.Elapsed.TotalSeconds:0.00} s");
             Check(Paste(() => true, () => false, () => { sent++; return true; }) is { } replaced && replaced.StartsWith("Another app changed the clipboard") && sent == 0, "clipboard replaced meanwhile: no paste, and says so");
+            Check(Paste(() => false, () => false, () => true, timeout: 0.2)?.StartsWith("Another app changed the clipboard") == true, "app never came back and the clipboard changed: doesn't say to press Ctrl+V");
             Check(Paste(() => true, () => true, () => false)?.StartsWith("Windows blocked the keystrokes") == true, "keystrokes refused: says so");
         }),
 
@@ -622,6 +623,8 @@ static class Program
             var gone = Forgotten.Load()!;
             Check(gone.Has(shot, DateTime.Now.AddMinutes(-1)) && !gone.Has(download, DateTime.Now.AddMinutes(-1)), "the removed screenshot is skipped, the download isn't");
             Check(!gone.Has(shot, DateTime.Now.AddMinutes(1)), "a new file saved later at the same path still comes in");
+            Thread.Sleep(5);
+            Check(!gone.Has(shot, DateTime.Now), "even within the same second");
             model.ClearAll();
             Snapshots.Pump(0.5);
             gone = Forgotten.Load()!;

@@ -584,13 +584,14 @@ static class Win
     public static async Task<string?> PasteWhenReady(Func<bool> ready, Func<bool> stillOurs, Func<bool> send, double timeout = 1.5)
     {
         const string ctrlV = "It's on the clipboard, so press Ctrl+V to paste it.";
+        const string replaced = "Another app changed the clipboard first. Pick it again to paste it.";
         var started = DateTime.UtcNow;
         while (!ready())
         {
-            if ((DateTime.UtcNow - started).TotalSeconds >= timeout) return "The app didn't come back in time. " + ctrlV;
+            if ((DateTime.UtcNow - started).TotalSeconds >= timeout) return stillOurs() ? "The app didn't come back in time. " + ctrlV : replaced;
             await Task.Delay(10);
         }
-        if (!stillOurs()) return "Another app changed the clipboard first. Pick it again to paste it.";
+        if (!stillOurs()) return replaced;
         return send() ? null : "Windows blocked the keystrokes. " + ctrlV;
     }
 

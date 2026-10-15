@@ -409,7 +409,7 @@ sealed class Forgotten
 {
     static readonly string File = Path.Combine(Paths.Dir, "forgotten.json");
 
-    /// Unix seconds of the last Clear all: files added before it stay out.
+    /// Unix milliseconds of the last Clear all: files added before it stay out.
     public long ClearedAt { get; set; }
     /// Single files removed since, with when (dropped after 7 days, when the backfill no longer reaches them).
     /// A new file saved at the same path later still comes in.
@@ -426,22 +426,22 @@ sealed class Forgotten
 
     public bool Has(string path, DateTime added)
     {
-        var at = new DateTimeOffset(added).ToUnixTimeSeconds();
+        var at = new DateTimeOffset(added).ToUnixTimeMilliseconds();
         return at <= ClearedAt || Files.TryGetValue(path, out var removed) && at <= removed;
     }
 
     public static void Remove(Clip c)
     {
-        if (c.Source is "Screenshot" or "Downloads") Save(f => f.Files[c.Text] = DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        if (c.Source is "Screenshot" or "Downloads") Save(f => f.Files[c.Text] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 
-    public static void ClearAll() => Save(f => { f.ClearedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); f.Files.Clear(); });
+    public static void ClearAll() => Save(f => { f.ClearedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); f.Files.Clear(); });
 
     static void Save(Action<Forgotten> change)
     {
         var f = Load() ?? throw new IOException("Can't read " + File);
         change(f);
-        var cutoff = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (long)Db.Retention;
+        var cutoff = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)(Db.Retention * 1000);
         f.Files = f.Files.Where(p => p.Value >= cutoff).ToDictionary(p => p.Key, p => p.Value);
         Store.WriteAtomic(File, Encoding.UTF8.GetBytes(Store.Json.Serialize(f)));
     }
@@ -464,13 +464,15 @@ static class Board
     }
 
     /// Null once it's on the clipboard, otherwise why it isn't. Pasting then would paste whatever was there before.
+    /// Of several files, only the ones still there go on.
     public static string? Write(Clip c)
     {
+        var files = c.Paths.Where(p => System.IO.File.Exists(p) || Directory.Exists(p)).ToList();
         var data = c.Kind switch
         {
             ClipKind.Text => TextData(c.Text),
             ClipKind.Image => c.File is { } f && PngData(f) is { } png ? ImageData(png) : null,
-            _ => c.Paths.Any(p => System.IO.File.Exists(p) || Directory.Exists(p)) ? FilesData(c.Paths) : null,
+            _ => files.Count > 0 ? FilesData(files) : null,
         };
         if (data == null) return c.Kind == ClipKind.Image ? "Its image file is gone or can't be read." : "Its files are gone.";
         try { Set(data); return null; }
