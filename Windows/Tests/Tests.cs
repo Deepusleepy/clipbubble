@@ -619,12 +619,12 @@ static class Program
             model.Refresh();
             model.Delete(model.Clips.Single(c => c.Source == "Screenshot"));
             Snapshots.Pump(0.5);
-            var gone = Forgotten.Load();
+            var gone = Forgotten.Load()!;
             Check(gone.Has(shot, DateTime.Now.AddMinutes(-1)) && !gone.Has(download, DateTime.Now.AddMinutes(-1)), "the removed screenshot is skipped, the download isn't");
             Check(!gone.Has(shot, DateTime.Now.AddMinutes(1)), "a new file saved later at the same path still comes in");
             model.ClearAll();
             Snapshots.Pump(0.5);
-            gone = Forgotten.Load();
+            gone = Forgotten.Load()!;
             Check(gone.Has(download, DateTime.Now.AddMinutes(-1)), "after Clear all, files from before it are skipped");
             Check(!gone.Has(Path.Combine(Paths.Dir, "new.png"), DateTime.Now.AddMinutes(1)), "files added later still come in");
         }),
@@ -800,6 +800,26 @@ static class Program
             File.WriteAllText(Path.Combine(folder, "new.pdf"), "x");
             Snapshots.Pump(6);   // the watcher re-checks for a missing folder every 5 s
             Check(seen.SequenceEqual(new[] { "new.pdf" }), "reported: " + string.Join(",", seen));
+        }),
+
+        ("an unreadable removed-files list pauses the backfill instead of bringing everything back", () =>
+        {
+            var list = Path.Combine(Paths.Dir, "forgotten.json");
+            File.WriteAllText(list, "{\"ClearedAt\":1}");
+            using (new FileStream(list, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                Check(Forgotten.Load() == null, "can't read it: no list rather than an empty one");
+            Check(Forgotten.Load()?.ClearedAt == 1, "read again once it's free");
+        }),
+
+        ("a screen recording still being saved doesn't hold up a copied picture", () =>
+        {
+            var recording = Path.Combine(Paths.Dir, "Screen Recording 1.mp4");
+            using var db = new Db();
+            using var saving = new FileStream(recording, FileMode.Create, FileAccess.Write, FileShare.Read);
+            db.InsertIfMissing(ClipKind.File, recording, "Screenshot", "f:" + Store.Sha(recording), DateTime.Now);
+            var watch = Stopwatch.StartNew();
+            Check(new Recorder(db).Record(new Snapshot(Array.Empty<string>(), null, TinyPng(6), null), "Paint", DateTime.Now), "saved");
+            Check(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
         }),
 
         ("MCP over stdio from the real exe: tools, history, image, mascots", Mcp),

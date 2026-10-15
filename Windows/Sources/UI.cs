@@ -1871,7 +1871,7 @@ sealed class App : Application
     {
         foreach (var (watcher, source) in new[] { (screenshots, "Screenshot"), (downloads, "Downloads") })
             if (watcher != null)
-                capture.AddFiles(source, () => { var gone = Forgotten.Load(); return watcher.Existing(7).Where(f => !gone.Has(f.Path, f.Added)); }, model.Refresh);
+                capture.AddFiles(source, () => Forgotten.Load() is { } gone ? watcher.Existing(7).Where(f => !gone.Has(f.Path, f.Added)) : [], model.Refresh);
     }
 
     // MARK: Picking

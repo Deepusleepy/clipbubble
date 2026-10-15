@@ -301,14 +301,15 @@ sealed class Db : IDisposable
     public void DropCopiesOf(string screenshot)
     {
         var copies = Select("WHERE kind = 'image' AND created >= ?", Now - ScreenshotWindow);
-        if (copies.Count > 0) Store.WaitUntilWritten(screenshot);
+        if (copies.Count == 0 || !Store.IsImagePath(screenshot)) return;   // a screen recording is never a copied picture
+        Store.WaitUntilWritten(screenshot);
         foreach (var c in copies)
             if (c.File is { } f && Store.SamePicture(() => Store.OpenShared(f), () => Store.OpenShared(screenshot))) Delete(c.Id);
     }
 
     /// A copied picture is a screenshot that was saved moments ago.
     public bool IsRecentScreenshot(byte[] png) =>
-        Select("WHERE source = 'Screenshot' AND created >= ?", Now - ScreenshotWindow)
+        Select("WHERE source = 'Screenshot' AND created >= ?", Now - ScreenshotWindow).Where(c => Store.IsImagePath(c.Text))
             .Any(c => { Store.WaitUntilWritten(c.Text); return Store.SamePicture(() => new MemoryStream(png), () => Store.OpenShared(c.Text)); });
 
     public void Delete(string hash) => DeleteWhere("WHERE hash = ?", hash);
@@ -414,10 +415,13 @@ sealed class Forgotten
     /// A new file saved at the same path later still comes in.
     public Dictionary<string, long> Files { get; set; } = new();
 
-    public static Forgotten Load()
+    /// Null when the file is there but can't be read right now: the backfill then waits rather than bringing
+    /// everything back, and a removal fails rather than rewriting the list without the others.
+    public static Forgotten? Load()
     {
         try { return System.IO.File.Exists(File) ? Store.Json.Deserialize<Forgotten>(Store.ReadText(File)) ?? new() : new(); }
-        catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return new(); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
+        catch (Exception e) when (e is ArgumentException or InvalidOperationException) { return new(); }   // not JSON: start over
     }
 
     public bool Has(string path, DateTime added)
@@ -435,7 +439,7 @@ sealed class Forgotten
 
     static void Save(Action<Forgotten> change)
     {
-        var f = Load();
+        var f = Load() ?? throw new IOException("Can't read " + File);
         change(f);
         var cutoff = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (long)Db.Retention;
         f.Files = f.Files.Where(p => p.Value >= cutoff).ToDictionary(p => p.Key, p => p.Value);
