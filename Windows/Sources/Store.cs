@@ -411,6 +411,7 @@ sealed class Forgotten
     /// Unix seconds of the last Clear all: files added before it stay out.
     public long ClearedAt { get; set; }
     /// Single files removed since, with when (dropped after 7 days, when the backfill no longer reaches them).
+    /// A new file saved at the same path later still comes in.
     public Dictionary<string, long> Files { get; set; } = new();
 
     public static Forgotten Load()
@@ -419,7 +420,11 @@ sealed class Forgotten
         catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return new(); }
     }
 
-    public bool Has(string path, DateTime added) => new DateTimeOffset(added).ToUnixTimeSeconds() <= ClearedAt || Files.ContainsKey(path);
+    public bool Has(string path, DateTime added)
+    {
+        var at = new DateTimeOffset(added).ToUnixTimeSeconds();
+        return at <= ClearedAt || Files.TryGetValue(path, out var removed) && at <= removed;
+    }
 
     public static void Remove(Clip c)
     {

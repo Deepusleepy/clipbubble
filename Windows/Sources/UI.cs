@@ -79,7 +79,7 @@ sealed class Model
     {
         var kind = Store.ParseKind(Filter);
         var source = Filter switch { "shots" => "Screenshot", "downloads" => "Downloads", _ => null };
-        Clips = Db.Clips(kind: kind, source: source, query: Query);
+        Clips = Db.Clips(kind: kind, source: source, query: Query).Where(c => !deleting.Contains(c.Id)).ToList();
         if (!Clips.Any(c => c.Id == Selection)) selection = Clips.FirstOrDefault()?.Id;
         Thumbs.Prewarm(Clips.Take(40));
         Raise(Change.Clips);
@@ -87,7 +87,7 @@ sealed class Model
 
     public void ReloadRecent()
     {
-        Recent = Db.Clips(limit: 3);
+        Recent = Db.Clips(limit: 3 + deleting.Count).Where(c => !deleting.Contains(c.Id)).Take(3).ToList();
         Thumbs.Prewarm(Recent);
         Raise(Change.Recent);
     }
@@ -121,17 +121,23 @@ sealed class Model
         Filter = Filters[(i + delta + Filters.Length) % Filters.Length].Tag;
     }
 
+    /// Clips deleted here that the writer hasn't removed yet: reloads leave them out, so they can't be deleted twice.
+    readonly HashSet<long> deleting = new();
+
     /// Gone from the list at once; the reload after the write shows what's really stored (the clip again, if the delete failed).
+    /// A removed screenshot or download is remembered first, so a failure there can't let the backfill bring it back.
     public void Delete(Clip c)
     {
         var i = Math.Max(0, Clips.FindIndex(x => x.Id == c.Id));
+        deleting.Add(c.Id);
         Clips.RemoveAll(x => x.Id == c.Id);
         if (Selection == c.Id) selection = Clips.Count == 0 ? null : Clips[Math.Min(i, Clips.Count - 1)].Id;
         Raise(Change.Clips);
-        Writer.Write(db => { db.Delete(c.Id); Forgotten.Remove(c); }, Refresh);
+        if (Recent.RemoveAll(x => x.Id == c.Id) > 0) Raise(Change.Recent);
+        Writer.Write(db => { Forgotten.Remove(c); db.Delete(c.Id); }, () => { deleting.Remove(c.Id); Refresh(); });
     }
 
-    public void ClearAll() => Writer.Write(db => { db.DeleteAll(); Forgotten.ClearAll(); }, Refresh);
+    public void ClearAll() => Writer.Write(db => { Forgotten.ClearAll(); db.DeleteAll(); }, Refresh);
 
     public void Refresh()
     {
@@ -1659,6 +1665,13 @@ sealed class App : Application
     (ModifierKeys Mods, Key Key) hotkey = (ModifierKeys.Control | ModifierKeys.Shift, Key.Space);
 
     public Window PanelWindow => panel;
+
+    /// A delete or Clear all the user asked for still happens when they quit right after.
+    protected override void OnExit(ExitEventArgs e)
+    {
+        model.Writer.Finish(TimeSpan.FromSeconds(5));
+        base.OnExit(e);
+    }
 
     protected override void OnStartup(StartupEventArgs e)
     {

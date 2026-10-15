@@ -619,7 +619,8 @@ static class Program
             model.Delete(model.Clips.Single(c => c.Source == "Screenshot"));
             Snapshots.Pump(0.5);
             var gone = Forgotten.Load();
-            Check(gone.Has(shot, DateTime.Now) && !gone.Has(download, DateTime.Now.AddMinutes(-1)), "the removed screenshot is skipped, the download isn't");
+            Check(gone.Has(shot, DateTime.Now.AddMinutes(-1)) && !gone.Has(download, DateTime.Now.AddMinutes(-1)), "the removed screenshot is skipped, the download isn't");
+            Check(!gone.Has(shot, DateTime.Now.AddMinutes(1)), "a new file saved later at the same path still comes in");
             model.ClearAll();
             Snapshots.Pump(0.5);
             gone = Forgotten.Load();
@@ -731,6 +732,59 @@ static class Program
                 var frame = BitmapDecoder.Create(new Uri(db.Clips().Single().File!), BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0];
                 Check(frame.PixelWidth == 3 && frame.PixelHeight == 2, $"size {frame.PixelWidth}x{frame.PixelHeight} (color masks: {masks})");
             }
+        }),
+
+        ("a clip waiting to be deleted stays hidden when the list reloads", () =>
+        {
+            using (var db = new Db()) { db.Upsert(ClipKind.Text, "keep", null, "Notepad", "t:keep2"); db.Upsert(ClipKind.Text, "going", null, "Notepad", "t:going"); }
+            var model = new Model();
+            model.Refresh();
+            using (Sql.Hold(Paths.Db, "BEGIN IMMEDIATE"))
+            {
+                model.Delete(model.Clips.Single(c => c.Text == "going"));
+                model.Query = "o";
+                Check(model.Clips.All(c => c.Text != "going") && model.Recent.All(c => c.Text != "going"), "not shown again while the database is busy, so it can't be deleted twice");
+            }
+            Snapshots.Pump(0.5);
+            Check(model.Clips.Select(c => c.Text).SequenceEqual(new[] { "keep" }), "deleted once the database is free");
+        }),
+
+        ("quitting waits for a delete that's still queued", () =>
+        {
+            var writer = new Writer();
+            var done = false;
+            writer.Write(_ => { Thread.Sleep(300); done = true; });
+            Check(writer.Finish(TimeSpan.FromSeconds(5)) && done, "finished before returning");
+        }),
+
+        ("if the removed-files list can't be saved, the screenshot isn't deleted either", () =>
+        {
+            var shot = Path.Combine(Paths.Dir, "Screenshot 4.png");
+            File.WriteAllBytes(shot, TinyPng());
+            using (var db = new Db()) db.InsertIfMissing(ClipKind.File, shot, "Screenshot", "f:" + Store.Sha(shot), DateTime.Now);
+            var list = Path.Combine(Paths.Dir, "forgotten.json");
+            File.WriteAllText(list, "{}");
+            var model = new Model();
+            model.Refresh();
+            using (new FileStream(list, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                model.Delete(model.Clips.Single());
+                Snapshots.Pump(1);
+            }
+            Check(model.Clips.Count == 1, "still in history, rather than gone now and back after the next backfill");
+        }),
+
+        ("copying the previous item again after deleting it saves it", () =>
+        {
+            using var db = new Db();
+            var r = new Recorder(db);
+            var t0 = DateTime.Now;
+            r.Record(Text("first"), "Notepad", t0);
+            r.Record(Text("second"), "Notepad", t0.AddSeconds(5));
+            db.Delete(db.Clips().Single(c => c.Text == "first").Id);
+            r.Record(Text("first"), "Notepad", t0.AddSeconds(6));
+            var texts = db.Clips().Select(c => c.Text).OrderBy(t => t).ToList();
+            Check(texts.SequenceEqual(new[] { "first", "second" }), "both kept: " + string.Join(",", texts));
         }),
 
         ("MCP over stdio from the real exe: tools, history, image, mascots", Mcp),

@@ -37,6 +37,9 @@ sealed class Writer
     }
 
     /// A delete or cleanup. `then` runs on the UI thread even if it failed, so a view that re-reads shows what's really stored.
+    /// Waits for everything queued so far, up to `timeout`.
+    public bool Finish(TimeSpan timeout) => chain.Wait(timeout);
+
     public void Write(Action<Db> write, Action? then = null) =>
         Run(() =>
         {
@@ -100,7 +103,7 @@ sealed class Capture : IDisposable
         catch (COMException) { handled = seen; return; }
         handled = seen;
         if (data == null || Read(data) is not { } snapshot) return;
-        var (from, at) = (source, DateTime.Now);   // when it was copied, not when the writer gets to it
+        var (from, at) = (source, DateTime.Now);   // paste-through tools are spotted by when things were copied, not by when the writer got to them
         writer.Run(() => recorder.Record(snapshot, from.Name, at, from.Ours), onChange);
     }
 
@@ -165,7 +168,7 @@ sealed class Recorder(Db db)
 
         // The previous contents came straight back, so what we just saw was a paste-through: drop it,
         // and don't bump the restored item.
-        if (clip.Hash == previousHash && last is { } l && (now - l.At).TotalSeconds < 2.5)
+        if (clip.Hash == previousHash && last is { } l && (now - l.At).TotalSeconds < 2.5 && db.Exists(clip.Hash))
         {
             if (l.Inserted) db.Delete(l.Hash);
             last = (clip.Hash, now, false);
