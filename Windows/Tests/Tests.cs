@@ -425,6 +425,9 @@ static class Program
             Thumbs.Load(broken, 64, _ => calls++);
             Snapshots.Pump(1);
             Check(calls == 2, $"{calls} of 2 callbacks ran; a stuck decode leaves the row blank until a restart");
+            Thumbs.Load("C:\\bad<name>.png", 64, _ => calls++);   // a path Windows rejects outright
+            Snapshots.Pump(1);
+            Check(calls == 3, "a path that can't even be looked at still finishes");
         }),
 
         ("a broken WebP doesn't break copies, agents or mascots", () =>
@@ -752,9 +755,11 @@ static class Program
                 model.Delete(model.Clips.Single(c => c.Text == "going"));
                 model.Query = "o";
                 Check(model.Clips.All(c => c.Text != "going") && model.Recent.All(c => c.Text != "going"), "not shown again while the database is busy, so it can't be deleted twice");
+                Check(model.DeletesWaiting, "quitting now would wait for it");
             }
             Snapshots.Pump(0.5);
             Check(model.Clips.Select(c => c.Text).SequenceEqual(new[] { "keep" }), "deleted once the database is free");
+            Check(!model.DeletesWaiting, "nothing left to wait for");
         }),
 
         ("quitting waits for a delete that's still queued", () =>

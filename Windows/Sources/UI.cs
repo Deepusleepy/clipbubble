@@ -124,6 +124,8 @@ sealed class Model
 
     /// Clips deleted here that the writer hasn't removed yet: reloads leave them out, so they can't be deleted twice.
     readonly HashSet<long> deleting = new();
+    bool clearing;
+    public bool DeletesWaiting => deleting.Count > 0 || clearing;
 
     /// Gone from the list at once; the reload after the write shows what's really stored (the clip again, if the delete failed).
     /// A removed screenshot or download is remembered first, so a failure there can't let the backfill bring it back.
@@ -143,11 +145,16 @@ sealed class Model
         });
     }
 
-    public void ClearAll() => Writer.Write(db => { Forgotten.ClearAll(); db.DeleteAll(); }, failed =>
+    public void ClearAll()
     {
-        Refresh();
-        if (failed is { } e) ShowError("Couldn't clear history", Why(e));
-    });
+        clearing = true;
+        Writer.Write(db => { Forgotten.ClearAll(); db.DeleteAll(); }, failed =>
+        {
+            clearing = false;
+            Refresh();
+            if (failed is { } e) ShowError("Couldn't clear history", Why(e));
+        });
+    }
 
     /// SQLite reports a database another process holds as busy or locked; anything else (a full disk) is said as is.
     static string Why(Exception e) => e.Message.Contains("locked") || e.Message.Contains("busy")
@@ -194,8 +201,12 @@ static class Thumbs
         {
             BitmapSource? img = null;
             Size? dims = null;
-            var version = Version(path);   // here, not on the UI thread: a network drive can take a while to answer
-            try { if (version != failed) (img, dims) = Store.DecodeFit(path, px); }
+            (long, DateTime)? version = null;
+            try
+            {
+                version = Version(path);   // here, not on the UI thread: a network drive can take a while to answer
+                if (version != failed) (img, dims) = Store.DecodeFit(path, px);
+            }
             catch (Exception e)
             {
                 // Whatever failed, the callbacks below still run; otherwise this picture would stay blank until a restart.
@@ -203,7 +214,7 @@ static class Thumbs
             }
             dispatcher.BeginInvoke(new Action(() =>
             {
-                if (img == null) Failed[key] = version;
+                if (img == null && version is { } v) Failed[key] = v;
                 else if (px <= 64) Remember(Cache, key, img);   // row thumbnails only, so previews don't pile up
                 if (dims is { } d) Dims[path] = d;
                 var callbacks = Pending[key];
@@ -1786,10 +1797,11 @@ sealed class App : Application
 
     public Window PanelWindow => panel;
 
-    /// A delete or Clear all the user asked for still happens when they quit right after.
+    /// Queued writes get 5 s to finish on quit, or 30 s while a delete or Clear all the user asked for is still waiting
+    /// behind them (a long backfill can be in front).
     protected override void OnExit(ExitEventArgs e)
     {
-        model.Writer.Finish(TimeSpan.FromSeconds(5));
+        model.Writer.Finish(TimeSpan.FromSeconds(model.DeletesWaiting ? 30 : 5));
         base.OnExit(e);
     }
 
