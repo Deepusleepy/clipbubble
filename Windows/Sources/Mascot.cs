@@ -131,7 +131,11 @@ static class Mascots
                     {
                         file = $"{id}-{state}.svg";
                         copied.Add(Path.Combine(Dir, file));
-                        File.WriteAllText(copied.Last(), value);
+                        try { File.WriteAllText(copied.Last(), value); }
+                        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                        {
+                            throw new MascotException($"couldn't save the {state} SVG: {e.Message}");
+                        }
                     }
                     else
                     {

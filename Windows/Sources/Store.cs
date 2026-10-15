@@ -113,6 +113,9 @@ static class Store
         }
     }
 
+    /// The first `n` characters, without cutting an emoji or other surrogate pair in half.
+    public static string Head(string s, int n) => s.Length <= n ? s : s.Substring(0, char.IsHighSurrogate(s[n - 1]) ? n - 1 : n);
+
     public static Stream OpenShared(string path) => new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
 
     /// Decodes at most `px` on the longer side, so a huge picture shown small doesn't hold its full size in memory.
@@ -360,19 +363,31 @@ sealed class Db : IDisposable
     }
 
     /// ClipBubble 1.3.0 for Windows kept removed screenshots and downloads in forgotten.json. They move into
-    /// `forgotten` once: each path it listed, and each of `files` added before its last Clear all.
-    public void ImportLegacyForgotten(Func<IEnumerable<(string Path, DateTime Added)>> files)
+    /// `forgotten` once, with when they were removed: each path it listed, and each of `files` added before its last
+    /// Clear all. False while the file is there but can't be read, so the folder import waits rather than bringing
+    /// those files back.
+    public bool ImportLegacyForgotten(Func<IEnumerable<(string Path, DateTime Added)>> files)
     {
         var json = Path.Combine(Paths.Dir, "forgotten.json");
-        if (!System.IO.File.Exists(json)) return;
+        if (!System.IO.File.Exists(json)) return true;
         Dictionary<string, object?> old;
         try { old = Store.Json.Deserialize<Dictionary<string, object?>>(Store.ReadText(json)) ?? new(); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException) { old = new(); }   // not JSON: nothing to keep
-        var clearedAt = old.TryGetValue("ClearedAt", out var c) && c != null ? Convert.ToDouble(c) / 1000 : 0;
-        var paths = (old.TryGetValue("Files", out var f) && f is Dictionary<string, object?> listed ? listed.Keys : Enumerable.Empty<string>()).ToList();
-        if (clearedAt > 0) paths.AddRange(files().Where(x => new DateTimeOffset(x.Added).ToUnixTimeMilliseconds() / 1000.0 <= clearedAt).Select(x => x.Path));
-        foreach (var p in paths.Distinct()) Run("INSERT OR REPLACE INTO forgotten(hash, at) VALUES(?, ?)", "f:" + Store.Sha(p), Now);
+        static double Seconds(object? ms)
+        {
+            try { return ms == null ? 0 : Convert.ToDouble(ms, System.Globalization.CultureInfo.InvariantCulture) / 1000; }
+            catch (Exception e) when (e is FormatException or InvalidCastException or OverflowException) { return 0; }
+        }
+        var clearedAt = Seconds(old.GetValueOrDefault("ClearedAt"));
+        var removed = (old.GetValueOrDefault("Files") as Dictionary<string, object?> ?? new())
+            .ToDictionary(p => p.Key, p => Seconds(p.Value) is > 0 and var at ? at : Now);
+        if (clearedAt > 0)
+            foreach (var (path, added) in files())
+                if (new DateTimeOffset(added).ToUnixTimeMilliseconds() / 1000.0 <= clearedAt && !removed.ContainsKey(path)) removed[path] = clearedAt;
+        foreach (var r in removed) Run("INSERT OR REPLACE INTO forgotten(hash, at) VALUES(?, ?)", "f:" + Store.Sha(r.Key), r.Value);
         System.IO.File.Delete(json);
+        return true;
     }
 
     /// Only our own copies of images are deleted, never a screenshot or download the clip points at.

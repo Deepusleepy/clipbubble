@@ -1063,7 +1063,7 @@ sealed class Row : Border
     }
 
     /// Only the start of the text matters for a row, so long copies don't slow the list.
-    string Head => clip.Text.Length > 20_000 ? clip.Text.Substring(0, 20_000) : clip.Text;
+    string Head => Store.Head(clip.Text, 20_000);
 
     string FirstLine => Head.Split('\n', '\r').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim() ?? "";
 
@@ -1367,7 +1367,7 @@ sealed class PreviewPane : Border
 {
     /// Laying out megabytes of text would freeze the panel; the full text still pastes.
     static string Shown(string text) =>
-        text.Length > 100_000 ? text.Substring(0, 100_000) + "\n\n… the rest is too long to preview, but it pastes in full" : text;
+        text.Length > 100_000 ? Store.Head(text, 100_000) + "\n\n… the rest is too long to preview, but it pastes in full" : text;
 
     public PreviewPane(Clip clip)
     {
@@ -2027,11 +2027,12 @@ sealed class App : Application
     /// so it also reruns later.
     void ImportFolders()
     {
+        // On the writer, each import first moves 1.3.0's list in; while that file can't be read, nothing is imported.
         var watched = new[] { screenshots, downloads }.Where(w => w != null).ToList();
-        model.Writer.Write(db => db.ImportLegacyForgotten(() => watched.SelectMany(w => w!.Existing(7))));
+        bool Ready() => model.Writer.Db.ImportLegacyForgotten(() => watched.SelectMany(w => w!.Existing(7)));
         foreach (var (watcher, source) in new[] { (screenshots, "Screenshot"), (downloads, "Downloads") })
             if (watcher != null)
-                capture.AddFiles(source, () => watcher.Existing(7), model.Refresh);
+                capture.AddFiles(source, () => Ready() ? watcher.Existing(7) : [], model.Refresh);
     }
 
     // MARK: Picking

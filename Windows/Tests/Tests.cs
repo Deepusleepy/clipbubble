@@ -214,6 +214,7 @@ static class Program
                 try { db.Delete(clip.Id); } catch (InvalidOperationException) { }
             }
             Check(db.Clips().Count == 1 && File.Exists(clip.File!), "row and its image are both still there");
+            Check(Sql.Query(Paths.Db, "SELECT count(*) FROM forgotten")[0] == "0", "and nothing half-remembered");
         }),
 
         ("app names that are really file names read like names", () =>
@@ -822,7 +823,12 @@ static class Program
             var expected = new[] { removed, beforeClear }.Select(f => "f:" + Store.Sha(f)).OrderBy(h => h, StringComparer.Ordinal).ToList();
             Check(hashes.SequenceEqual(expected), "the listed file and the one from before Clear all: " + hashes.Count);
             Check(!File.Exists(json), "the old file is gone, so this happens once");
-            db.ImportLegacyForgotten(() => throw new Exception("not asked again"));
+            Check(Sql.Query(Paths.Db, $"SELECT CAST(at * 1000 AS INTEGER) FROM forgotten WHERE hash = 'f:{Store.Sha(removed)}'")[0] == (clearedAt + 1000).ToString(), "kept with when it was removed");
+            Check(db.ImportLegacyForgotten(() => throw new Exception("not asked again")), "nothing left to move");
+            File.WriteAllText(json, "{}");
+            using (new FileStream(json, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                Check(!db.ImportLegacyForgotten(() => listed), "a file that can't be read yet holds the import back");
+            Check(File.Exists(json), "and is kept for next time");
         }),
 
         ("a screen recording still being saved doesn't hold up a copied picture", () =>
@@ -851,6 +857,13 @@ static class Program
             Check(missing.Visibility == Visibility.Collapsed, "no icon: collapsed");
         }),
 
+        ("cutting long text never splits an emoji", () =>
+        {
+            Check(Store.Head("ab\U0001F600cd", 3) == "ab", "cut before the emoji, not through it");
+            Check(Store.Head("ab\U0001F600cd", 4) == "ab\U0001F600", "or after it");
+            Check(Store.Head("short", 10) == "short", "short text is left alone");
+        }),
+
         ("search treats % and _ as plain characters", () =>
         {
             using var db = new Db();
@@ -870,6 +883,7 @@ static class Program
             var r = new Recorder(db);
             var huge = new string('x', Recorder.MaxTextBytes + 1);
             Check(!r.Record(Text(huge), "Notepad", DateTime.Now), "over 2 MB: skipped");
+            Check(!r.Record(Text(new string('€', 700_000)), "Notepad", DateTime.Now.AddSeconds(1)), "700,000 euro signs are 2.1 MB in UTF-8: skipped too");
             var lines = string.Concat(Enumerable.Range(0, 30_000).Select(i => "line " + i + "\n"));
             Check(r.Record(Text(lines), "Notepad", DateTime.Now.AddSeconds(5)), "under 2 MB: saved");
             var clip = db.Clips().Single();
