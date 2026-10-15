@@ -390,7 +390,11 @@ sealed class FolderWatcher : IDisposable
         if (stopped) return;
         check.Start();
         if (!Directory.Exists(Folder)) return;
-        watchedCreated = Created(Folder);
+        // A different folder than last time (renamed and made again, deleted and restored): its files aren't new,
+        // except ones made since this watcher started. A date that can't be read is taken as the same folder.
+        var created = Created(Folder);
+        if (watchedCreated != default && created != DateTime.MinValue && created != watchedCreated) known = null;
+        if (created != DateTime.MinValue) watchedCreated = created;
         var dispatcher = Dispatcher.CurrentDispatcher;
         var w = new FileSystemWatcher(Folder) { NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName, IncludeSubdirectories = false };
         FileSystemEventHandler changed = (_, _) => dispatcher.BeginInvoke(new Action(() => { debounce.Stop(); debounce.Start(); }));
@@ -419,16 +423,14 @@ sealed class FolderWatcher : IDisposable
         {
             var exists = Directory.Exists(Folder);
             var now = exists ? Created(Folder) : DateTime.MinValue;
-            // A different folder at the path (renamed and made again, or restored). One whose date can't be read
-            // right now is taken as the same.
             var replaced = exists && now != DateTime.MinValue && created != default && now != created;
             var restart = watching ? !exists || replaced : exists;
             dispatcher.BeginInvoke(new Action(() =>
             {
                 checking = false;
-                if (stopped || !restart) return;
-                if (replaced) known = null;   // its files aren't new, except ones made since this watcher started
-                Restart();
+                if (stopped) return;
+                if (restart) Restart();
+                else if (watchedCreated == default && now != DateTime.MinValue) watchedCreated = now;   // its date became readable
             }));
         });
     }

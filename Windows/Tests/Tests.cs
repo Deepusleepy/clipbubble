@@ -829,7 +829,10 @@ static class Program
             var hashes = Sql.Query(Paths.Db, "SELECT hash FROM forgotten ORDER BY hash");
             var expected = new[] { removed, beforeClear }.Select(f => "f:" + Store.Sha(f)).OrderBy(h => h, StringComparer.Ordinal).ToList();
             Check(hashes.SequenceEqual(expected), "the listed file and the one from before Clear all: " + hashes.Count);
-            Check(!File.Exists(json), "the old file is gone, so this happens once");
+            Check(File.Exists(json), "kept while a folder isn't there (an unplugged drive), so its Clear all still applies later");
+            Directory.CreateDirectory(Path.Combine(Paths.Dir, "not there"));
+            Check(db.ImportLegacyForgotten(folders), "moved again once it is");
+            Check(!File.Exists(json), "and then the old file is gone");
             Check(Sql.Query(Paths.Db, $"SELECT CAST(at * 1000 AS INTEGER) FROM forgotten WHERE hash = 'f:{Store.Sha(removed)}'")[0] == (clearedAt + 1000).ToString(), "kept with when it was removed");
             Check(db.ImportLegacyForgotten(folders), "nothing left to move");
             File.WriteAllText(json, "{}");

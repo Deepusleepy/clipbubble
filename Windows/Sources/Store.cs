@@ -386,9 +386,13 @@ sealed class Db : IDisposable
             .Select(p => (Path: p.Key, At: Seconds(p.Value) is > 0 and var at ? at : Now))
             .Where(p => !System.IO.File.Exists(p.Path) || Added(p.Path) <= p.At)
             .ToDictionary(p => p.Path, p => p.At);
+        // A folder that isn't there (an unplugged drive) keeps the file around, so the Clear all still covers it once it
+        // is, until that Clear all is older than anything the import looks at.
+        var missing = false;
         if (clearedAt > 0)
-            foreach (var folder in folders.Where(f => f != null && Directory.Exists(f)))
+            foreach (var folder in folders.Where(f => f != null))
             {
+                if (!Directory.Exists(folder)) { missing = true; continue; }
                 try
                 {
                     foreach (var entry in new DirectoryInfo(folder!).EnumerateFileSystemInfos())
@@ -398,7 +402,7 @@ sealed class Db : IDisposable
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }
             }
         foreach (var r in removed) Run("INSERT OR REPLACE INTO forgotten(hash, at) VALUES(?, ?)", "f:" + Store.Sha(r.Key), r.Value);
-        System.IO.File.Delete(json);
+        if (!missing || clearedAt < Now - Retention) System.IO.File.Delete(json);
         return true;
     }
 
