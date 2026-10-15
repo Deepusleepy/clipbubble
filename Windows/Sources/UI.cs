@@ -135,10 +135,21 @@ sealed class Model
         if (Selection == c.Id) selection = Clips.Count == 0 ? null : Clips[Math.Min(i, Clips.Count - 1)].Id;
         Raise(Change.Clips);
         if (Recent.RemoveAll(x => x.Id == c.Id) > 0) Raise(Change.Recent);
-        Writer.Write(db => { Forgotten.Remove(c); db.Delete(c.Id); }, () => { deleting.Remove(c.Id); Refresh(); });
+        Writer.Write(db => { Forgotten.Remove(c); db.Delete(c.Id); }, failed =>
+        {
+            deleting.Remove(c.Id);
+            Refresh();
+            if (failed) ShowError("Couldn't delete that", Busy);
+        });
     }
 
-    public void ClearAll() => Writer.Write(db => { Forgotten.ClearAll(); db.DeleteAll(); }, Refresh);
+    public void ClearAll() => Writer.Write(db => { Forgotten.ClearAll(); db.DeleteAll(); }, failed =>
+    {
+        Refresh();
+        if (failed) ShowError("Couldn't clear history", Busy);
+    });
+
+    const string Busy = "Another app is using ClipBubble's history right now. Try again in a moment.";
 
     public void Refresh()
     {
@@ -156,6 +167,14 @@ static class Thumbs
     static readonly Dictionary<(string, int), BitmapSource?> Cache = new();
     static readonly Dictionary<(string, int), List<Action<BitmapSource?>>> Pending = new();
     static readonly Dictionary<string, Size> Dims = new();
+    /// Pictures that failed to decode, by file version: tried again only once the file changes (it may have been saving).
+    static readonly Dictionary<(string, int), (long, DateTime)> Failed = new();
+
+    static (long, DateTime) Version(string path)
+    {
+        var f = new FileInfo(path);
+        return f.Exists ? (f.Length, f.LastWriteTimeUtc) : (-1, DateTime.MinValue);
+    }
 
     public static Size? SizeOf(string path) => Dims.TryGetValue(path, out var s) ? s : null;
 
@@ -164,6 +183,7 @@ static class Thumbs
     {
         var key = (path, px);
         if (Cache.TryGetValue(key, out var hit)) { done(hit); return; }
+        if (Failed.TryGetValue(key, out var failed) && failed == Version(path)) { done(null); return; }
         if (Pending.TryGetValue(key, out var waiting)) { waiting.Add(done); return; }
         Pending[key] = new List<Action<BitmapSource?>> { done };
         var dispatcher = Dispatcher.CurrentDispatcher;
@@ -171,6 +191,7 @@ static class Thumbs
         {
             BitmapSource? img = null;
             Size? dims = null;
+            var version = Version(path);
             try { (img, dims) = Store.DecodeFit(path, px); }
             catch (Exception e)
             {
@@ -179,13 +200,21 @@ static class Thumbs
             }
             dispatcher.BeginInvoke(new Action(() =>
             {
-                if (px <= 64 && img != null) Cache[key] = img;   // row thumbnails only, so previews don't pile up; a failure is retried, as the file may have been saving
+                if (img == null) Failed[key] = version;
+                else if (px <= 64) Remember(Cache, key, img);   // row thumbnails only, so previews don't pile up
                 if (dims is { } d) Dims[path] = d;
                 var callbacks = Pending[key];
                 Pending.Remove(key);
                 foreach (var callback in callbacks) callback(img);
             }));
         });
+    }
+
+    /// Caches stay small: past 300 entries they start over, and anything still on screen is decoded again.
+    public static void Remember<TKey>(Dictionary<TKey, BitmapSource?> cache, TKey key, BitmapSource? image)
+    {
+        if (cache.Count >= 300) cache.Clear();
+        cache[key] = image;
     }
 
     public static void Prewarm(IEnumerable<Clip> clips)
@@ -409,20 +438,34 @@ sealed class SpringEase : EasingFunctionBase
 /// Icons for files and apps from the Windows shell, with transparency intact.
 static unsafe class Shell
 {
-    // UI thread only. The shell takes up to ~150 ms for a file type's first icon (a PDF's), so icons are drawn in
-    // order on one background thread, in the single-threaded apartment shell objects expect.
+    // UI thread only. The shell takes up to ~150 ms for a file type's first icon (a PDF's), so icons are drawn on a
+    // background thread, in the single-threaded apartment shell objects expect.
     static readonly Dictionary<string, BitmapSource?> Cache = new();
     static readonly Dictionary<string, List<Action<BitmapSource?>>> Pending = new();
-    static readonly BlockingCollection<Action> Work = Worker();
+    static readonly BlockingCollection<Action> Work = new();
+    static readonly List<Worker> Workers = new();
     static readonly Guid IID_IShellItemImageFactory = new("bcc18b79-ba16-442f-80c4-8a59c30c463b");
 
-    static BlockingCollection<Action> Worker()
+    /// One icon thread, and when a third-party icon handler hangs it, another, so the icons queued behind still come.
+    sealed class Worker
     {
-        var queue = new BlockingCollection<Action>();
-        var thread = new Thread(() => { foreach (var work in queue.GetConsumingEnumerable()) work(); }) { IsBackground = true, Name = "Shell icons" };
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        return queue;
+        long busySince;   // Stopwatch ticks while drawing, 0 while waiting
+        public bool Stuck => Volatile.Read(ref busySince) is var t && t != 0 && Stopwatch.GetTimestamp() - t > 2 * Stopwatch.Frequency;
+
+        public Worker()
+        {
+            var thread = new Thread(() =>
+            {
+                foreach (var work in Work.GetConsumingEnumerable())
+                {
+                    Volatile.Write(ref busySince, Stopwatch.GetTimestamp());
+                    work();
+                    Volatile.Write(ref busySince, 0);
+                }
+            }) { IsBackground = true, Name = "Shell icons" };
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+        }
     }
 
     /// Calls `done` right away for an icon already drawn, otherwise on the UI thread once the shell has drawn it.
@@ -432,6 +475,7 @@ static unsafe class Shell
         if (Cache.TryGetValue(key, out var hit)) { done(hit); return; }
         if (Pending.TryGetValue(key, out var waiting)) { waiting.Add(done); return; }
         Pending[key] = new List<Action<BitmapSource?>> { done };
+        if (Workers.All(w => w.Stuck)) Workers.Add(new Worker());
         var ui = Dispatcher.CurrentDispatcher;
         Work.Add(() =>
         {
@@ -440,7 +484,7 @@ static unsafe class Shell
             catch (Exception e) { Log.Error(e); }   // the callbacks still run, so a row never waits forever
             ui.BeginInvoke(new Action(() =>
             {
-                Cache[key] = img;
+                Thumbs.Remember(Cache, key, img);
                 var callbacks = Pending[key];
                 Pending.Remove(key);
                 foreach (var callback in callbacks) callback(img);

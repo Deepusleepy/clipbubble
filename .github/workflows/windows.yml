@@ -9,11 +9,13 @@ on:
     types: [published]
   workflow_dispatch:
 
+# Read-only by default. Only the release job below can write, and only when a release is published.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v7
       - run: dotnet build Windows/Tests/ClipBubble.Tests.csproj -c Release -nologo
@@ -23,8 +25,19 @@ jobs:
         with:
           name: ClipBubble-Windows
           path: ClipBubble-Windows.zip
-      # Publishing a release (from the Mac, as usual) attaches the Windows build to it.
-      - if: github.event_name == 'release'
-        run: gh release upload "${{ github.event.release.tag_name }}" ClipBubble-Windows.zip --clobber
+
+  # Publishing a release (from the Mac, as usual) attaches the Windows build to it.
+  release:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: ClipBubble-Windows
+      - run: gh release upload "$TAG" ClipBubble-Windows.zip --clobber --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}

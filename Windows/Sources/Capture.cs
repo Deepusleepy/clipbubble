@@ -36,17 +36,21 @@ sealed class Writer
         }, TaskScheduler.Default);
     }
 
-    /// A delete or cleanup. `then` runs on the UI thread even if it failed, so a view that re-reads shows what's really stored.
     /// Waits for everything queued so far, up to `timeout`.
     public bool Finish(TimeSpan timeout) => chain.Wait(timeout);
 
-    public void Write(Action<Db> write, Action? then = null) =>
+    /// A delete or cleanup. `then` runs on the UI thread even if it failed (and is told whether it did), so a view
+    /// that re-reads shows what's really stored.
+    public void Write(Action<Db> write, Action<bool>? then = null)
+    {
+        var failed = false;
         Run(() =>
         {
             try { write(Db); }
-            catch (Exception e) { Log.Error(e); }
+            catch (Exception e) { Log.Error(e); failed = true; }
             return true;
-        }, then ?? delegate { });
+        }, () => then?.Invoke(failed));
+    }
 }
 
 /// Listens for clipboard changes and records each one, on the writer, once it has settled.
