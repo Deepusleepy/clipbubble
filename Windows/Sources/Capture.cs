@@ -417,8 +417,19 @@ sealed class FolderWatcher : IDisposable
         var (dispatcher, watching, created) = (Dispatcher.CurrentDispatcher, watcher != null, watchedCreated);
         Task.Run(() =>
         {
-            var moved = !watching ? Directory.Exists(Folder) : !Directory.Exists(Folder) || Created(Folder) != created;
-            dispatcher.BeginInvoke(new Action(() => { checking = false; if (moved && !stopped) Restart(); }));
+            var exists = Directory.Exists(Folder);
+            var now = exists ? Created(Folder) : DateTime.MinValue;
+            // A different folder at the path (renamed and made again, or restored). One whose date can't be read
+            // right now is taken as the same.
+            var replaced = exists && now != DateTime.MinValue && created != default && now != created;
+            var restart = watching ? !exists || replaced : exists;
+            dispatcher.BeginInvoke(new Action(() =>
+            {
+                checking = false;
+                if (stopped || !restart) return;
+                if (replaced) known = null;   // its files aren't new, except ones made since this watcher started
+                Restart();
+            }));
         });
     }
 

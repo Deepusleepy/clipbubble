@@ -813,6 +813,8 @@ static class Program
             var downloads = Path.Combine(Paths.Dir, "legacy-downloads");
             Directory.CreateDirectory(downloads);
             var removed = Path.Combine(Paths.Dir, "Screenshot old.png");
+            var downloadedAgain = Path.Combine(Paths.Dir, "report.pdf");
+            File.WriteAllText(downloadedAgain, "a new copy, saved after it was removed");
             var beforeClear = Path.Combine(downloads, "before.pdf");
             var afterClear = Path.Combine(downloads, "after.pdf");
             File.WriteAllText(beforeClear, "x");
@@ -820,7 +822,7 @@ static class Program
             File.SetCreationTime(beforeClear, DateTime.Now.AddHours(-2));
             var clearedAt = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeMilliseconds();
             var json = Path.Combine(Paths.Dir, "forgotten.json");
-            File.WriteAllText(json, new JavaScriptSerializer().Serialize(new { ClearedAt = clearedAt, Files = new Dictionary<string, long> { [removed] = clearedAt + 1000 } }));
+            File.WriteAllText(json, new JavaScriptSerializer().Serialize(new { ClearedAt = clearedAt, Files = new Dictionary<string, long> { [removed] = clearedAt + 1000, [downloadedAgain] = clearedAt + 2000 } }));
             using var db = new Db();
             var folders = new[] { downloads, null, Path.Combine(Paths.Dir, "not there") };
             Check(db.ImportLegacyForgotten(folders), "moved");
@@ -934,6 +936,9 @@ static class Program
             using var watcher = new FolderWatcher(folder, null, _ => true, (path, _) => seen.Add(Path.GetFileName(path)));
             Directory.Move(folder, folder + "-old");
             Directory.CreateDirectory(folder);
+            var restored = Path.Combine(folder, "restored.pdf");   // brought back by a sync tool, say: not new
+            File.WriteAllText(restored, "x");
+            File.SetCreationTime(restored, DateTime.Now.AddDays(-2));
             Thread.Sleep(50);
             Snapshots.Pump(6);   // checked every 5 s
             File.WriteAllText(Path.Combine(folder, "new.png"), "x");

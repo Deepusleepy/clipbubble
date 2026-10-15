@@ -380,8 +380,12 @@ sealed class Db : IDisposable
             catch (Exception e) when (e is FormatException or InvalidCastException or OverflowException) { return 0; }
         }
         var clearedAt = Seconds(old.GetValueOrDefault("ClearedAt"));
+        static double Added(string path) => new DateTimeOffset(System.IO.File.GetCreationTime(path)).ToUnixTimeMilliseconds() / 1000.0;
+        // 1.3.0 let a file saved at a removed path later come back in; one already there now still does.
         var removed = (old.GetValueOrDefault("Files") as Dictionary<string, object?> ?? new())
-            .ToDictionary(p => p.Key, p => Seconds(p.Value) is > 0 and var at ? at : Now);
+            .Select(p => (Path: p.Key, At: Seconds(p.Value) is > 0 and var at ? at : Now))
+            .Where(p => !System.IO.File.Exists(p.Path) || Added(p.Path) <= p.At)
+            .ToDictionary(p => p.Path, p => p.At);
         if (clearedAt > 0)
             foreach (var folder in folders.Where(f => f != null && Directory.Exists(f)))
             {
