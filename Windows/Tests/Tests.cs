@@ -461,20 +461,20 @@ static class Program
             Check(reply["isError"] is true, "clipboard_set tells the agent it didn't copy");
         }),
 
-        ("auto-paste waits for the app, and never pastes after the clipboard changed", () =>
+        ("auto-paste waits for the app, never pastes after the clipboard changed, and says why it didn't paste", () =>
         {
-            static bool Paste(Func<bool> ready, Func<bool> stillOurs, Func<bool> send, double timeout = 1.5) =>
+            static string? Paste(Func<bool> ready, Func<bool> stillOurs, Func<bool> send, double timeout = 1.5) =>
                 System.Threading.Tasks.Task.Run(() => Win.PasteWhenReady(ready, stillOurs, send, timeout)).Result;
             var polls = 0;
             var sent = 0;
-            Check(Paste(() => ++polls >= 5, () => true, () => { sent++; return true; }) && sent == 1, $"pasted once the app was ready (sent {sent})");
+            Check(Paste(() => ++polls >= 5, () => true, () => { sent++; return true; }) == null && sent == 1, $"pasted once the app was ready (sent {sent})");
             Check(polls == 5, $"checked {polls} times before pasting");
             sent = 0;
             var watch = Stopwatch.StartNew();
-            Check(!Paste(() => false, () => true, () => { sent++; return true; }, timeout: 0.2) && sent == 0, "app never came back: no paste");
+            Check(Paste(() => false, () => true, () => { sent++; return true; }, timeout: 0.2) is { } late && late.Contains("Ctrl+V") && sent == 0, "app never came back: no paste, and press Ctrl+V");
             Check(watch.Elapsed.TotalSeconds < 1, $"gave up after {watch.Elapsed.TotalSeconds:0.00} s");
-            Check(!Paste(() => true, () => false, () => { sent++; return true; }) && sent == 0, "clipboard replaced meanwhile: no paste");
-            Check(!Paste(() => true, () => true, () => false), "keystrokes refused: reported");
+            Check(Paste(() => true, () => false, () => { sent++; return true; }) is { } replaced && replaced.StartsWith("Another app changed the clipboard") && sent == 0, "clipboard replaced meanwhile: no paste, and says so");
+            Check(Paste(() => true, () => true, () => false)?.StartsWith("Windows blocked the keystrokes") == true, "keystrokes refused: says so");
         }),
 
         ("deleting a clip or clearing history never waits on the database", () =>
@@ -820,6 +820,21 @@ static class Program
             var watch = Stopwatch.StartNew();
             Check(new Recorder(db).Record(new Snapshot(Array.Empty<string>(), null, TinyPng(6), null), "Paint", DateTime.Now), "saved");
             Check(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        }),
+
+        ("file icons load in the background, and a missing one takes no space", () =>
+        {
+            var doc = Path.Combine(Paths.Dir, "icon-" + Guid.NewGuid().ToString("N").Substring(0, 6) + ".pdf");
+            File.WriteAllText(doc, "%PDF");
+            BitmapSource? icon = null;
+            var calls = 0;
+            Shell.Icon(doc, 64, b => { icon = b; calls++; });
+            Check(calls == 0, "returned before the shell drew it");
+            Snapshots.Pump(1);
+            Check(calls == 1 && icon != null, "drawn and handed back");
+            var missing = Shell.IconImage(Path.Combine(Paths.Dir, "no such folder", "x.pdf"), 64);
+            Snapshots.Pump(1);
+            Check(missing.Visibility == Visibility.Collapsed, "no icon: collapsed");
         }),
 
         ("MCP over stdio from the real exe: tools, history, image, mascots", Mcp),

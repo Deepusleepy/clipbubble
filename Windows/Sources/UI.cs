@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -408,13 +409,55 @@ sealed class SpringEase : EasingFunctionBase
 /// Icons for files and apps from the Windows shell, with transparency intact.
 static unsafe class Shell
 {
+    // UI thread only. The shell takes up to ~150 ms for a file type's first icon (a PDF's), so icons are drawn in
+    // order on one background thread, in the single-threaded apartment shell objects expect.
     static readonly Dictionary<string, BitmapSource?> Cache = new();
+    static readonly Dictionary<string, List<Action<BitmapSource?>>> Pending = new();
+    static readonly BlockingCollection<Action> Work = Worker();
     static readonly Guid IID_IShellItemImageFactory = new("bcc18b79-ba16-442f-80c4-8a59c30c463b");
 
-    public static BitmapSource? Icon(string path, int px)
+    static BlockingCollection<Action> Worker()
+    {
+        var queue = new BlockingCollection<Action>();
+        var thread = new Thread(() => { foreach (var work in queue.GetConsumingEnumerable()) work(); }) { IsBackground = true, Name = "Shell icons" };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return queue;
+    }
+
+    /// Calls `done` right away for an icon already drawn, otherwise on the UI thread once the shell has drawn it.
+    public static void Icon(string path, int px, Action<BitmapSource?> done)
     {
         var key = $"{px}|{path}";
-        if (Cache.TryGetValue(key, out var hit)) return hit;
+        if (Cache.TryGetValue(key, out var hit)) { done(hit); return; }
+        if (Pending.TryGetValue(key, out var waiting)) { waiting.Add(done); return; }
+        Pending[key] = new List<Action<BitmapSource?>> { done };
+        var ui = Dispatcher.CurrentDispatcher;
+        Work.Add(() =>
+        {
+            BitmapSource? img = null;
+            try { img = Draw(path, px); }
+            catch (Exception e) { Log.Error(e); }   // the callbacks still run, so a row never waits forever
+            ui.BeginInvoke(new Action(() =>
+            {
+                Cache[key] = img;
+                var callbacks = Pending[key];
+                Pending.Remove(key);
+                foreach (var callback in callbacks) callback(img);
+            }));
+        });
+    }
+
+    /// An image that fills in once its icon is drawn, and disappears if there's none.
+    public static Image IconImage(string path, int px)
+    {
+        var image = new Image();
+        Icon(path, px, img => { image.Source = img; if (img == null) image.Visibility = Visibility.Collapsed; });
+        return image;
+    }
+
+    static BitmapSource? Draw(string path, int px)
+    {
         BitmapSource? result = null;
         if (SHCreateItemFromParsingName(path, IntPtr.Zero, IID_IShellItemImageFactory, out var factory) >= 0)
         {
@@ -427,7 +470,7 @@ static unsafe class Shell
             }
             Marshal.Release(factory);
         }
-        return Cache[key] = result;
+        return result;
     }
 
     /// Reads the 32-bit premultiplied pixels directly; WPF's own HBITMAP conversion drops the alpha.
@@ -537,16 +580,18 @@ static class Win
     }
 
     /// Waits up to `timeout` seconds for `ready` (the app is back in front and the keys used to pick are released),
-    /// then sends the paste, unless something else replaced the clipboard meanwhile. Returns whether it was sent.
-    public static async Task<bool> PasteWhenReady(Func<bool> ready, Func<bool> stillOurs, Func<bool> send, double timeout = 1.5)
+    /// then sends the paste, unless something else replaced the clipboard meanwhile. Null once sent, otherwise why not.
+    public static async Task<string?> PasteWhenReady(Func<bool> ready, Func<bool> stillOurs, Func<bool> send, double timeout = 1.5)
     {
+        const string ctrlV = "It's on the clipboard, so press Ctrl+V to paste it.";
         var started = DateTime.UtcNow;
         while (!ready())
         {
-            if ((DateTime.UtcNow - started).TotalSeconds >= timeout) return false;
+            if ((DateTime.UtcNow - started).TotalSeconds >= timeout) return "The app didn't come back in time. " + ctrlV;
             await Task.Delay(10);
         }
-        return stillOurs() && send();
+        if (!stillOurs()) return "Another app changed the clipboard first. Pick it again to paste it.";
+        return send() ? null : "Windows blocked the keystrokes. " + ctrlV;
     }
 
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
@@ -659,16 +704,18 @@ static class Glass
 /// The Mac's NSAlert in dark mode: Windows' own message box is always light, so this draws one in the panel's style.
 static class Alert
 {
-    /// Returns true when the user picks `action` (Enter); false for Cancel or Esc.
+    /// Returns true when the user picks `action` (Enter); false for Cancel or Esc. Centered on `owner` while it's on
+    /// screen, otherwise on the screen (a hidden window, like the panel when an item is picked from the peek, can't own it).
     public static bool Show(Window owner, string title, string message, string action, string? cancel = "Cancel")
     {
         var result = false;
         var dialog = new Window
         {
-            Owner = owner, WindowStyle = WindowStyle.None, ResizeMode = ResizeMode.NoResize, AllowsTransparency = true,
+            WindowStyle = WindowStyle.None, ResizeMode = ResizeMode.NoResize, AllowsTransparency = true,
             Background = Brushes.Transparent, ShowInTaskbar = false, Topmost = true, SizeToContent = SizeToContent.WidthAndHeight,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = owner.IsVisible ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen,
         };
+        if (owner.IsVisible) dialog.Owner = owner;
         var body = new StackPanel { Width = 280, Margin = new Thickness(18, 16, 18, 14) };
         var heading = UI.Label(title, 13, UI.Primary, FontWeights.SemiBold);
         heading.TextWrapping = TextWrapping.Wrap;
@@ -915,8 +962,15 @@ sealed class Row : Border
     {
         "Screenshot" => UI.Icon(UI.Camera, 9.5),
         "Downloads" => UI.Icon(UI.Download, 9.5),
-        _ => Apps.ExePath(clip.Source) is { } exe && Shell.Icon(exe, 32) is { } img ? new Image { Source = img, Width = 12, Height = 12, VerticalAlignment = VerticalAlignment.Center } : null,
+        _ => Apps.ExePath(clip.Source) is { } exe ? Sized(Shell.IconImage(exe, 32), 12) : null,
     };
+
+    static Image Sized(Image image, double size)
+    {
+        image.Width = image.Height = size;
+        image.VerticalAlignment = VerticalAlignment.Center;
+        return image;
+    }
 
     string FirstLine => clip.Text.Split('\n', '\r').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim() ?? "";
 
@@ -976,7 +1030,9 @@ sealed class Tile : Border
         else if (clip.Paths.FirstOrDefault() is { } p)
         {
             BorderThickness = new Thickness(0);
-            Child = new Image { Source = Shell.Icon(p, 64), Margin = new Thickness(2) };
+            var icon = Shell.IconImage(p, 64);
+            icon.Margin = new Thickness(2);
+            Child = icon;
         }
         else if (UI.HexColor(clip.Text) is { } c) Background = new SolidColorBrush(c);
         else if (UI.IsUrl(clip.Text)) Symbol(UI.Link, Color.FromRgb(0x0A, 0x84, 0xFF), angle: -45);   // SF Symbols' link is diagonal
@@ -1222,7 +1278,9 @@ sealed class PreviewPane : Border
         else if (clip.Paths is { Length: > 0 } paths)
         {
             var stack = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(20) };
-            stack.Children.Add(new Image { Source = Shell.Icon(paths[0], 128), Width = 64, Height = 64 });
+            var icon = Shell.IconImage(paths[0], 128);
+            icon.Width = icon.Height = 64;
+            stack.Children.Add(icon);
             stack.Children.Add(new TextBox
             {
                 Text = string.Join("\n", paths), IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
@@ -1887,10 +1945,13 @@ sealed class App : Application
         HidePeek();
         if (!paste || !Prefs.Get("autoPaste", true) || target == IntPtr.Zero || !Win.IsWindow(target) || !Win.CanPasteInto(target)) return;
         Win.SetForegroundWindow(target);
-        await Win.PasteWhenReady(
+        var failed = await Win.PasteWhenReady(
             () => Win.GetForegroundWindow() == target && !Win.ModifiersDown(),
             () => Win.GetClipboardSequenceNumber() == copied,
             Win.SendPaste);
+        if (failed == null) return;
+        model.ShowError("Couldn't paste", failed);
+        Win.SetForegroundWindow(target);   // back to the app, ready for Ctrl+V
     }
 
     void HandleKey(object sender, KeyEventArgs e)
