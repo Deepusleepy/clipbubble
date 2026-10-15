@@ -73,28 +73,38 @@ enum Mascots {
         if kind != "blob", (states["idle"] ?? "").isEmpty { throw MascotError("\(kind) needs an idle value") }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
-        let base = name.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" }
+        let slug = name.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" }
             .reduce(into: "") { s, c in if !(c == "-" && s.hasSuffix("-")) { s.append(c) } }
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        var id = base.isEmpty ? "mascot" : base, n = 2
+        let base = slug.isEmpty ? "mascot" : slug
+        var id = base, n = 2
         while all().contains(where: { $0.id == id }) { id = "\(base)-\(n)"; n += 1 }
 
         var m = Mascot(id: id, name: name, kind: kind, color: kind == "blob" ? color : nil)
+        var copied: [URL] = []
+        // A failed add leaves nothing behind.
+        func fail(_ message: String) -> MascotError {
+            copied.forEach { try? FileManager.default.removeItem(at: $0) }
+            return MascotError(message)
+        }
         for state in ["idle", "hover", "active"] {
             guard var value = states[state]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { continue }
             if kind == "image" {
                 let file: String
                 if value.hasPrefix("<svg") || value.hasPrefix("<?xml") {
                     file = "\(id)-\(state).svg"
-                    try Data(value.utf8).write(to: dir.appendingPathComponent(file))
+                    do { try Data(value.utf8).write(to: dir.appendingPathComponent(file)) }
+                    catch { throw fail("couldn't save the \(state) SVG: \(error.localizedDescription)") }
                 } else {
                     let src = URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
                     file = "\(id)-\(state).\(src.pathExtension.lowercased())"
                     try? FileManager.default.removeItem(at: dir.appendingPathComponent(file))
-                    try FileManager.default.copyItem(at: src, to: dir.appendingPathComponent(file))
+                    do { try FileManager.default.copyItem(at: src, to: dir.appendingPathComponent(file)) }
+                    catch { throw fail("couldn't read the \(state) image at \(src.path)") }
                 }
+                copied.append(dir.appendingPathComponent(file))
                 guard NSImage(contentsOf: dir.appendingPathComponent(file)) != nil else {
-                    throw MascotError("couldn't read the \(state) image; use PNG, GIF, JPG or SVG")
+                    throw fail("couldn't read the \(state) image; use PNG, GIF, JPG or SVG")
                 }
                 value = file
             }
@@ -106,17 +116,20 @@ enum Mascots {
         }
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try enc.encode(m).write(to: dir.appendingPathComponent(id + ".json"))
+        do { try enc.encode(m).write(to: dir.appendingPathComponent(id + ".json")) }
+        catch { throw fail("couldn't save the mascot: \(error.localizedDescription)") }
         notify()
         return m
     }
 
     /// Deletes a custom mascot and its images. Built-ins can't be removed.
     static func remove(_ id: String) -> Bool {
-        guard custom().contains(where: { $0.id == id }) else { return false }
-        let files = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-        for f in files where f == id + ".json" || f.hasPrefix(id + "-") {
-            try? FileManager.default.removeItem(at: dir.appendingPathComponent(f))
+        guard let m = custom().first(where: { $0.id == id }) else { return false }
+        // Only this mascot's own files: removing "fox" must not touch "fox-2".
+        var files = [id + ".json"]
+        if m.kind == "image" { files += [m.idle, m.hover, m.active].compactMap { $0 }.filter { !$0.hasPrefix("/") } }
+        for f in Set(files) {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent((f as NSString).lastPathComponent))
         }
         if activeID() == id { setActive("blob") } else { notify() }
         return true

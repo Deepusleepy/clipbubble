@@ -236,6 +236,11 @@ final class BubbleView: NSView {
 
     override func hitTest(_ p: NSPoint) -> NSView? { frame.contains(p) ? self : nil }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .button }
+    override func accessibilityLabel() -> String? { "ClipBubble" }
+    override func accessibilityHelp() -> String? { "Opens your clipboard history" }
+    override func accessibilityPerformPress() -> Bool { onClick(); return true }
 
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
@@ -366,8 +371,11 @@ struct Row: View, Equatable {
         }
     }
 
+    /// Only the start of the text matters for a row, so long copies don't slow the list.
+    private var head: Substring { clip.text.prefix(20_000) }
+
     private var firstLine: String {
-        clip.text.split(whereSeparator: \.isNewline).first { !$0.allSatisfy(\.isWhitespace) }
+        head.split(whereSeparator: \.isNewline).first { !$0.allSatisfy(\.isWhitespace) }
             .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
     }
 
@@ -388,15 +396,16 @@ struct Row: View, Equatable {
         if clip.kind == "file", let p = clip.paths.first {
             parts.append(((p as NSString).deletingLastPathComponent as NSString).abbreviatingWithTildeInPath)
         } else if clip.kind == "text" {
-            let lines = clip.text.split(whereSeparator: \.isNewline).count
-            if lines > 1 { parts.append("\(lines) lines") }
+            let lines = head.split(whereSeparator: \.isNewline).count
+            if lines > 1 { parts.append(clip.text.count > head.count ? "\(lines)+ lines" : "\(lines) lines") }
         }
         return parts.joined(separator: " · ")
     }
 
     private var dragItem: NSItemProvider {
-        if let p = clip.imagePath ?? clip.paths.first, let item = NSItemProvider(contentsOf: URL(fileURLWithPath: p)) {
-            return item
+        if let p = clip.imagePath ?? clip.paths.first {
+            // A file that's gone drags nothing rather than an empty string.
+            return NSItemProvider(contentsOf: URL(fileURLWithPath: p)) ?? NSItemProvider()
         }
         return NSItemProvider(object: clip.text as NSString)
     }
@@ -813,7 +822,10 @@ struct PreviewPane: View {
                 .padding(20)
             } else {
                 ScrollView {
-                    Text(clip.text).font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
+                    // Laying out megabytes of text would freeze the panel; the full text still pastes.
+                    let shown = clip.text.prefix(100_000)
+                    Text(shown.count < clip.text.count ? shown + "\n\n… the rest is too long to preview, but it pastes in full" : shown)
+                        .font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(14)
                 }
             }
@@ -970,18 +982,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Backfills the last 7 days of screenshots and downloads. Cheap and idempotent, so it also reruns after access is granted.
     private func importFolders() {
-        if let screenshots {
-            for (url, date) in screenshots.existing(days: 7) {
-                model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: "f:" + sha(url.path), created: date)
+        let (shots, dls) = (screenshots, downloads)
+        // Listing a big Downloads folder and reading every file's dates is slow: do it off the main thread.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let found = (shots?.existing(days: 7) ?? []).map { ($0, $1, "Screenshot") }
+                + (dls?.existing(days: 7) ?? []).map { ($0, $1, "Downloads") }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                for (url, date, source) in found {
+                    self.model.db.insertIfMissing(kind: "file", text: url.path, source: source, hash: "f:" + sha(url.path), created: date)
+                }
+                self.model.reload()
+                self.model.reloadRecent()
             }
         }
-        if let downloads {
-            for (url, date) in downloads.existing(days: 7) {
-                model.db.insertIfMissing(kind: "file", text: url.path, source: "Downloads", hash: "f:" + sha(url.path), created: date)
-            }
-        }
-        model.reload()
-        model.reloadRecent()
     }
 
     private func hosted<V: View>(_ view: V, size: NSSize, radius: CGFloat) -> NSView {
@@ -1012,9 +1026,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Puts the clip on the clipboard and, unless copying only, pastes it into the app underneath.
     private func pick(_ c: Clip, paste: Bool) {
-        Board.write(c)
+        let written = Board.write(c)
         hidePanel()
         hidePeek()
+        // Its image or files are gone: say so rather than paste whatever was copied before.
+        guard written else { NSSound.beep(); return }
         guard paste, UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true else { return }
         guard AXIsProcessTrusted() else {
             if !askedForAccessibility {

@@ -8,6 +8,7 @@ cp Info.plist $APP/Contents/
 cp Assets/AppIcon.icns $APP/Contents/Resources/
 swiftc -O -swift-version 5 Sources/*.swift -o $APP/Contents/MacOS/ClipBubble
 codesign --force -s - $APP
-pkill -x ClipBubble || true
+# Quit the running app, but not `ClipBubble --mcp` servers that agents are using.
+pkill -f 'ClipBubble.app/Contents/MacOS/ClipBubble$' || true
 rm -rf ~/Applications/$APP && cp -R $APP ~/Applications/
 open ~/Applications/$APP

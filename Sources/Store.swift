@@ -36,15 +36,19 @@ final class DB {
     private var h: OpaquePointer?
 
     init() {
+        // Clipboard history is private: keep the folder readable by this user only.
         try? FileManager.default.createDirectory(at: Paths.images, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: Paths.dir.path)
         sqlite3_open(Paths.db.path, &h)
         sqlite3_busy_timeout(h, 3000)
+        // `forgotten` remembers screenshots and downloads you deleted, so the folder import doesn't bring them back.
         sqlite3_exec(h, """
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS clips(
               id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
               file TEXT, source TEXT NOT NULL DEFAULT '', hash TEXT UNIQUE NOT NULL, created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS clips_created ON clips(created);
+            CREATE TABLE IF NOT EXISTS forgotten(hash TEXT PRIMARY KEY, at REAL NOT NULL);
             """, nil, nil, nil)
     }
 
@@ -92,10 +96,13 @@ final class DB {
             """, kind, text, file, source, hash, Date().timeIntervalSince1970)
     }
 
-    /// Adds a clip with its own timestamp, leaving any existing identical clip untouched.
+    /// Adds a clip with its own timestamp, leaving any existing identical clip untouched,
+    /// unless the user deleted it (a screenshot or download they removed stays removed).
     func insertIfMissing(kind: String, text: String, source: String, hash: String, created: Date) {
-        run("INSERT OR IGNORE INTO clips(kind,text,source,hash,created) VALUES(?,?,?,?,?)",
-            kind, text, source, hash, created.timeIntervalSince1970)
+        run("""
+            INSERT OR IGNORE INTO clips(kind,text,source,hash,created)
+            SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM forgotten WHERE hash = ?)
+            """, kind, text, source, hash, created.timeIntervalSince1970, hash)
     }
 
     func clips(limit: Int = 300, kind: String? = nil, source: String? = nil,
@@ -111,33 +118,57 @@ final class DB {
             args.append(kind)
         }
         if let source { tail += " AND source = ? COLLATE NOCASE"; args.append(source) }
-        if let query, !query.isEmpty { tail += " AND (text LIKE ? OR source LIKE ?)"; args += ["%\(query)%", "%\(query)%"] }
+        if let query, !query.isEmpty {
+            // Match % and _ literally: search is plain text, not a pattern.
+            let q = "%" + query.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
+            tail += " AND (text LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')"
+            args += [q, q]
+        }
         tail += Prefs.hiddenSQL
         tail += " ORDER BY created DESC LIMIT ?"
         args.append(limit)
         return select(tail, args)
     }
 
-    func clip(id: Int64) -> Clip? { select("WHERE id = ?", [id]).first }
+    /// One clip by id. Items in categories switched off in Settings stay hidden here too (agents use this).
+    func clip(id: Int64) -> Clip? { select("WHERE id = ?" + Prefs.hiddenSQL, [id]).first }
 
     func exists(hash: String) -> Bool { !select("WHERE hash = ?", [hash]).isEmpty }
 
+    /// Removes a clip the app captured itself (a paste-through), without remembering it as deleted.
     func delete(hash: String) {
         removeFiles(select("WHERE hash = ?", [hash]))
         run("DELETE FROM clips WHERE hash = ?", hash)
     }
 
+    /// Only images ClipBubble stored itself are deleted; screenshots, downloads and copied files belong to the user.
     private func removeFiles(_ clips: [Clip]) {
-        for c in clips { if let f = c.file { try? FileManager.default.removeItem(atPath: f) } }
+        for c in clips {
+            guard let f = c.file, (f as NSString).deletingLastPathComponent == Paths.images.path else { continue }
+            try? FileManager.default.removeItem(atPath: f)
+        }
+    }
+
+    /// Screenshots and downloads come from folders that get re-imported; remember deleting them.
+    private func forget(_ clips: [Clip]) {
+        let now = Date().timeIntervalSince1970
+        for c in clips where c.source == "Screenshot" || c.source == "Downloads" {
+            run("INSERT OR REPLACE INTO forgotten(hash, at) SELECT hash, ? FROM clips WHERE id = ?", now, c.id)
+        }
     }
 
     func delete(id: Int64) {
-        removeFiles(select("WHERE id = ?", [id]))
+        let rows = select("WHERE id = ?", [id])
+        forget(rows)
+        removeFiles(rows)
         run("DELETE FROM clips WHERE id = ?", id)
     }
 
     func deleteAll() {
-        removeFiles(select("", []))
+        let rows = select("", [])
+        forget(rows)
+        removeFiles(rows)
         run("DELETE FROM clips")
     }
 
@@ -146,6 +177,8 @@ final class DB {
         let cutoff = Date().timeIntervalSince1970 - Self.retention
         removeFiles(select("WHERE created < ?", [cutoff]))
         run("DELETE FROM clips WHERE created < ?", cutoff)
+        // A file older than the window is never re-imported, so the reminder can go a day after.
+        run("DELETE FROM forgotten WHERE at < ?", cutoff - 86400)
     }
 }
 
@@ -176,14 +209,24 @@ enum Board {
             .flatMap { NSBitmapImageRep(data: $0) }?.representation(using: .png, properties: [:])
     }
 
-    static func write(_ c: Clip) {
+    /// Puts a clip on the clipboard. Returns false, leaving the clipboard alone, when its image or files are gone,
+    /// so a paste never lands whatever was copied before.
+    @discardableResult
+    static func write(_ c: Clip) -> Bool {
         switch c.kind {
-        case "text": writeText(c.text)
+        case "text":
+            writeText(c.text)
+            return true
         case "image":
-            guard let f = c.file, let d = pngData(f) else { return }
+            guard let f = c.file, let d = pngData(f) else { return false }
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setData(d, forType: .png)
-        default: writeFiles(c.paths.map { URL(fileURLWithPath: $0) })
+            return true
+        default:
+            let urls = c.paths.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
+            guard !urls.isEmpty else { return false }
+            writeFiles(urls)
+            return true
         }
     }
 

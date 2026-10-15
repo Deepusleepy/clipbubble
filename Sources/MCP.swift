@@ -94,8 +94,13 @@ enum MCP {
 
     static func run() {
         while let line = readLine() {
-            guard let msg = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
-                  let id = msg["id"] else { continue }  // notifications need no reply
+            guard let msg = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else {
+                if !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                    send(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]])
+                }
+                continue
+            }
+            guard let id = msg["id"] else { continue }  // notifications need no reply
             let params = msg["params"] as? [String: Any] ?? [:]
             switch msg["method"] as? String {
             case "initialize":
@@ -119,7 +124,7 @@ enum MCP {
 
         switch name {
         case "clipboard_history":
-            let clips = db.clips(limit: min(Int(int("limit") ?? 20), 100), kind: a["kind"] as? String,
+            let clips = db.clips(limit: max(1, min(Int(int("limit") ?? 20), 100)), kind: a["kind"] as? String,
                                  source: a["source"] as? String, query: a["query"] as? String,
                                  sinceHours: (a["since_hours"] as? NSNumber)?.doubleValue)
             if clips.isEmpty { return text("No clipboard items match.") }
@@ -129,13 +134,17 @@ enum MCP {
             }.joined(separator: "\n\n"))
         case "clipboard_get":
             guard let id = int("id"), let c = db.clip(id: id) else { return text("No item with that id.", error: true) }
-            var content: [[String: Any]] = [["type": "text", "text": header(c) + "\n" + (c.kind == "image" ? (c.file ?? "") : c.text)]]
+            // Very long text is cut so one item can't flood the agent's context.
+            let limit = 200_000
+            let body = c.kind == "image" ? (c.file ?? "")
+                : c.text.count > limit ? String(c.text.prefix(limit)) + "\n… (cut: \(c.text.count) characters in all)" : c.text
+            var content: [[String: Any]] = [["type": "text", "text": header(c) + "\n" + body]]
             if let p = c.imagePath, let b64 = imageBase64(p) { content.append(["type": "image", "data": b64, "mimeType": "image/png"]) }
             return ["content": content]
         case "clipboard_set":
             if let t = a["text"] as? String { Board.writeText(t); return text("Copied text to the clipboard.") }
             guard let id = int("id"), let c = db.clip(id: id) else { return text("Pass text or a valid id.", error: true) }
-            Board.write(c)
+            guard Board.write(c) else { return text("Item #\(id)'s image or files no longer exist.", error: true) }
             return text("Copied item #\(id) to the clipboard.")
         case "mascot_list":
             let active = Mascots.activeID(), custom = Set(Mascots.custom().map(\.id))
