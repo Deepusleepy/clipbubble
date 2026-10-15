@@ -810,24 +810,29 @@ static class Program
 
         ("removals saved by 1.3.0 in forgotten.json move into the shared table once", () =>
         {
+            var downloads = Path.Combine(Paths.Dir, "legacy-downloads");
+            Directory.CreateDirectory(downloads);
             var removed = Path.Combine(Paths.Dir, "Screenshot old.png");
-            var beforeClear = Path.Combine(Paths.Dir, "before.pdf");
-            var afterClear = Path.Combine(Paths.Dir, "after.pdf");
+            var beforeClear = Path.Combine(downloads, "before.pdf");
+            var afterClear = Path.Combine(downloads, "after.pdf");
+            File.WriteAllText(beforeClear, "x");
+            File.WriteAllText(afterClear, "x");
+            File.SetCreationTime(beforeClear, DateTime.Now.AddHours(-2));
             var clearedAt = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeMilliseconds();
             var json = Path.Combine(Paths.Dir, "forgotten.json");
             File.WriteAllText(json, new JavaScriptSerializer().Serialize(new { ClearedAt = clearedAt, Files = new Dictionary<string, long> { [removed] = clearedAt + 1000 } }));
             using var db = new Db();
-            var listed = new[] { (beforeClear, DateTime.Now.AddHours(-2)), (afterClear, DateTime.Now) };
-            db.ImportLegacyForgotten(() => listed);
+            var folders = new[] { downloads, null, Path.Combine(Paths.Dir, "not there") };
+            Check(db.ImportLegacyForgotten(folders), "moved");
             var hashes = Sql.Query(Paths.Db, "SELECT hash FROM forgotten ORDER BY hash");
             var expected = new[] { removed, beforeClear }.Select(f => "f:" + Store.Sha(f)).OrderBy(h => h, StringComparer.Ordinal).ToList();
             Check(hashes.SequenceEqual(expected), "the listed file and the one from before Clear all: " + hashes.Count);
             Check(!File.Exists(json), "the old file is gone, so this happens once");
             Check(Sql.Query(Paths.Db, $"SELECT CAST(at * 1000 AS INTEGER) FROM forgotten WHERE hash = 'f:{Store.Sha(removed)}'")[0] == (clearedAt + 1000).ToString(), "kept with when it was removed");
-            Check(db.ImportLegacyForgotten(() => throw new Exception("not asked again")), "nothing left to move");
+            Check(db.ImportLegacyForgotten(folders), "nothing left to move");
             File.WriteAllText(json, "{}");
             using (new FileStream(json, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                Check(!db.ImportLegacyForgotten(() => listed), "a file that can't be read yet holds the import back");
+                Check(!db.ImportLegacyForgotten(folders), "a file that can't be read yet holds the import back");
             Check(File.Exists(json), "and is kept for next time");
         }),
 
@@ -903,6 +908,10 @@ static class Program
             var missing = Path.Combine(Paths.Dir, "nowhere.png");
             Check(Err(() => Mascots.Add("Half", "image", null, new() { ["idle"] = Svg, ["hover"] = missing })) == $"couldn't read the hover image at {missing}", "says which image");
             Check(!Directory.EnumerateFiles(Mascots.Dir, "half*").Any(), "the idle SVG it already saved is gone too");
+            var leftover = Path.Combine(Mascots.Dir, "fox-idle.png");
+            File.WriteAllBytes(leftover, TinyPng());
+            Err(() => Mascots.Add("Fox", "image", null, new() { ["idle"] = leftover, ["hover"] = missing }));
+            Check(File.Exists(leftover), "an image that was already in the mascot folder is never deleted");
         }),
 
         ("screen readers see the bubble as a ClipBubble button they can press", () =>
@@ -967,7 +976,8 @@ static class Program
             stdin.WriteLine("[1,2]");
             stdin.WriteLine("\"not an object\"");
             stdin.WriteLine("   ");
-            for (var i = 0; i < 2; i++)
+            stdin.WriteLine("null");
+            for (var i = 0; i < 3; i++)
             {
                 var reply = json.Deserialize<Dictionary<string, object>>(p.StandardOutput.ReadLine() ?? throw new Exception("server closed"));
                 Check(reply.ContainsKey("id") && reply["id"] == null && (int)((Dictionary<string, object>)reply["error"])["code"] == -32700, "parse error for a line that isn't a JSON object");

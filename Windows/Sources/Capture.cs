@@ -392,12 +392,18 @@ sealed class FolderWatcher : IDisposable
         if (!Directory.Exists(Folder)) return;
         watchedCreated = Created(Folder);
         var dispatcher = Dispatcher.CurrentDispatcher;
-        watcher = new FileSystemWatcher(Folder) { NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName, IncludeSubdirectories = false };
+        var w = new FileSystemWatcher(Folder) { NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName, IncludeSubdirectories = false };
         FileSystemEventHandler changed = (_, _) => dispatcher.BeginInvoke(new Action(() => { debounce.Stop(); debounce.Start(); }));
-        watcher.Created += changed;
-        watcher.Renamed += (s, e) => changed(s, e);
-        watcher.Error += (_, _) => dispatcher.BeginInvoke(new Action(Restart));   // e.g. the folder was deleted
-        watcher.EnableRaisingEvents = true;
+        w.Created += changed;
+        w.Renamed += (s, e) => changed(s, e);
+        w.Error += (_, _) => dispatcher.BeginInvoke(new Action(Restart));   // e.g. the folder was deleted
+        try { w.EnableRaisingEvents = true; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            w.Dispose();   // no access yet: the next check tries again
+            return;
+        }
+        watcher = w;
         Scan();
     }
 

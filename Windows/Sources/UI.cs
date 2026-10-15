@@ -2027,9 +2027,8 @@ sealed class App : Application
     /// so it also reruns later.
     void ImportFolders()
     {
-        // On the writer, each import first moves 1.3.0's list in; while that file can't be read, nothing is imported.
-        var watched = new[] { screenshots, downloads }.Where(w => w != null).ToList();
-        bool Ready() => model.Writer.Db.ImportLegacyForgotten(() => watched.SelectMany(w => w!.Existing(7)));
+        // On the writer, each import first moves 1.3.0's list in; while that can't be done, nothing is imported.
+        bool Ready() => model.Writer.Db.ImportLegacyForgotten(new[] { FolderWatcher.ScreenshotFolder, FolderWatcher.DownloadsFolder });
         foreach (var (watcher, source) in new[] { (screenshots, "Screenshot"), (downloads, "Downloads") })
             if (watcher != null)
                 capture.AddFiles(source, () => Ready() ? watcher.Existing(7) : [], model.Refresh);

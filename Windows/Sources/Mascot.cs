@@ -141,8 +141,16 @@ static class Mascots
                     {
                         var src = Environment.ExpandEnvironmentVariables(value.StartsWith("~") ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + value.Substring(1) : value);
                         file = $"{id}-{state}{Path.GetExtension(src).ToLowerInvariant()}";
-                        copied.Add(Path.Combine(Dir, file));
-                        try { File.Copy(src, copied.Last(), overwrite: true); }
+                        var dest = Path.Combine(Dir, file);
+                        try
+                        {
+                            // Already in place (a leftover file with this name): use it, and never delete it on failure.
+                            if (!string.Equals(Path.GetFullPath(src), Path.GetFullPath(dest), StringComparison.OrdinalIgnoreCase))
+                            {
+                                copied.Add(dest);
+                                File.Copy(src, dest, overwrite: true);
+                            }
+                        }
                         catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
                         {
                             throw new MascotException($"couldn't read the {state} image at {src}");

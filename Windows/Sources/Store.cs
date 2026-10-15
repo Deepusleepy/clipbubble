@@ -363,10 +363,10 @@ sealed class Db : IDisposable
     }
 
     /// ClipBubble 1.3.0 for Windows kept removed screenshots and downloads in forgotten.json. They move into
-    /// `forgotten` once, with when they were removed: each path it listed, and each of `files` added before its last
-    /// Clear all. False while the file is there but can't be read, so the folder import waits rather than bringing
-    /// those files back.
-    public bool ImportLegacyForgotten(Func<IEnumerable<(string Path, DateTime Added)>> files)
+    /// `forgotten` once, with when they were removed: each path it listed, and everything in `folders` (the screenshot
+    /// and Downloads folders, watched or not) added before its last Clear all. False while the file, or one of those
+    /// folders, can't be read, so the folder import waits rather than bringing those files back.
+    public bool ImportLegacyForgotten(IEnumerable<string?> folders)
     {
         var json = Path.Combine(Paths.Dir, "forgotten.json");
         if (!System.IO.File.Exists(json)) return true;
@@ -383,8 +383,16 @@ sealed class Db : IDisposable
         var removed = (old.GetValueOrDefault("Files") as Dictionary<string, object?> ?? new())
             .ToDictionary(p => p.Key, p => Seconds(p.Value) is > 0 and var at ? at : Now);
         if (clearedAt > 0)
-            foreach (var (path, added) in files())
-                if (new DateTimeOffset(added).ToUnixTimeMilliseconds() / 1000.0 <= clearedAt && !removed.ContainsKey(path)) removed[path] = clearedAt;
+            foreach (var folder in folders.Where(f => f != null && Directory.Exists(f)))
+            {
+                try
+                {
+                    foreach (var entry in new DirectoryInfo(folder!).EnumerateFileSystemInfos())
+                        if (new DateTimeOffset(entry.CreationTime).ToUnixTimeMilliseconds() / 1000.0 <= clearedAt && !removed.ContainsKey(entry.FullName))
+                            removed[entry.FullName] = clearedAt;
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }
+            }
         foreach (var r in removed) Run("INSERT OR REPLACE INTO forgotten(hash, at) VALUES(?, ?)", "f:" + Store.Sha(r.Key), r.Value);
         System.IO.File.Delete(json);
         return true;

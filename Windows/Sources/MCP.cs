@@ -96,14 +96,16 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
         string? line;
         while ((line = reader.ReadLine()) != null)
         {
+            if (line.Trim().Length == 0) continue;
             Dictionary<string, object?>? msg;
             try { msg = Store.Json.Deserialize<Dictionary<string, object?>>(line); }
-            catch (Exception)   // not a JSON object, however it fails to parse: say so and keep serving
+            catch (Exception) { msg = null; }   // however it fails to parse
+            if (msg == null)   // not a JSON object (`null` parses, but isn't one either): say so and keep serving
             {
-                if (line.Trim().Length > 0) Send(output, Obj(("jsonrpc", "2.0"), ("id", null!), ("error", Obj(("code", -32700), ("message", "Parse error")))));
+                Send(output, Obj(("jsonrpc", "2.0"), ("id", null!), ("error", Obj(("code", -32700), ("message", "Parse error")))));
                 continue;
             }
-            if (msg == null || !msg.TryGetValue("id", out var id) || id == null) continue;   // notifications need no reply
+            if (!msg.TryGetValue("id", out var id) || id == null) continue;   // notifications need no reply
             // One failing request (a locked database, a clipboard another app won't let go of) never stops the server.
             try { Handle(db, output, id, msg); }
             catch (Exception e)
