@@ -836,6 +836,9 @@ static class Program
             Check(Sql.Query(Paths.Db, $"SELECT CAST(at * 1000 AS INTEGER) FROM forgotten WHERE hash = 'f:{Store.Sha(removed)}'")[0] == (clearedAt + 1000).ToString(), "kept with when it was removed");
             Check(db.ImportLegacyForgotten(folders), "nothing left to move");
             File.WriteAllText(json, "{}");
+            File.SetAttributes(json, FileAttributes.ReadOnly);
+            try { Check(db.ImportLegacyForgotten(folders), "a file that can be read but not deleted doesn't hold the import back"); }
+            finally { File.SetAttributes(json, FileAttributes.Normal); }
             using (new FileStream(json, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
                 Check(!db.ImportLegacyForgotten(folders), "a file that can't be read yet holds the import back");
             Check(File.Exists(json), "and is kept for next time");
@@ -917,6 +920,10 @@ static class Program
             File.WriteAllBytes(leftover, TinyPng());
             Err(() => Mascots.Add("Fox", "image", null, new() { ["idle"] = leftover, ["hover"] = missing }));
             Check(File.Exists(leftover), "an image that was already in the mascot folder is never deleted");
+            var other = Path.Combine(Mascots.Dir, "owl-idle.png");
+            File.WriteAllBytes(other, TinyPng());
+            Err(() => Mascots.Add("Owl", "image", null, new() { ["idle"] = missing }));
+            Check(File.Exists(other), "not even when a different image fails to copy over it");
         }),
 
         ("screen readers see the bubble as a ClipBubble button they can press", () =>

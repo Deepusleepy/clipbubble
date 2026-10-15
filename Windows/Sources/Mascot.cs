@@ -130,8 +130,9 @@ static class Mascots
                     if (value!.StartsWith("<svg") || value.StartsWith("<?xml"))
                     {
                         file = $"{id}-{state}.svg";
-                        copied.Add(Path.Combine(Dir, file));
-                        try { File.WriteAllText(copied.Last(), value); }
+                        var dest = Path.Combine(Dir, file);
+                        if (!File.Exists(dest)) copied.Add(dest);   // only files this import makes are cleaned up
+                        try { File.WriteAllText(dest, value); }
                         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                         {
                             throw new MascotException($"couldn't save the {state} SVG: {e.Message}");
@@ -147,7 +148,7 @@ static class Mascots
                             // Already in place (a leftover file with this name): use it, and never delete it on failure.
                             if (!string.Equals(Path.GetFullPath(src), Path.GetFullPath(dest), StringComparison.OrdinalIgnoreCase))
                             {
-                                copied.Add(dest);
+                                if (!File.Exists(dest)) copied.Add(dest);
                                 File.Copy(src, dest, overwrite: true);
                             }
                         }

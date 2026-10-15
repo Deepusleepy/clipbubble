@@ -403,7 +403,9 @@ sealed class Db : IDisposable
                         removed[entry.FullName] = clearedAt;
             }
         foreach (var r in removed) Run("INSERT OR REPLACE INTO forgotten(hash, at) VALUES(?, ?)", "f:" + Store.Sha(r.Key), r.Value);
-        if (!missing || clearedAt < Now - Retention) System.IO.File.Delete(json);
+        if (!missing || clearedAt < Now - Retention)
+            try { System.IO.File.Delete(json); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }   // its rows are in; deleting is tried again next time
         return true;
     }
 
