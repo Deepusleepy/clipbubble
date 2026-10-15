@@ -52,6 +52,11 @@ static class Store
                 return;
             }
             catch (IOException) when (i < 10) { Thread.Sleep(20); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                try { System.IO.File.Delete(tmp); } catch (Exception x) when (x is IOException or UnauthorizedAccessException) { }   // the original error is the one to report
+                throw;
+            }
         }
     }
 
@@ -62,6 +67,11 @@ static class Store
         using var r = new StreamReader(f, Encoding.UTF8);
         return r.ReadToEnd();
     }
+
+    /// What reading a damaged, unsupported or unreadable picture throws. WIC errors that .NET doesn't map
+    /// (a broken WebP, for one) arrive as COMException.
+    public static bool Unreadable(Exception e) =>
+        e is IOException or UnauthorizedAccessException or NotSupportedException or FormatException or ArgumentException or COMException or OutOfMemoryException;
 
     public static readonly JavaScriptSerializer Json = new() { MaxJsonLength = int.MaxValue, RecursionLimit = 64 };
 
@@ -88,10 +98,49 @@ static class Store
             // Comparing sizes reads only the headers; the full decode runs only for a likely match.
             return Size(a) == Size(b) && Pixels(a).SequenceEqual(Pixels(b));
         }
-        catch (Exception e) when (e is NotSupportedException or FileFormatException or ArgumentException or IOException or UnauthorizedAccessException or OutOfMemoryException) { return false; }
+        catch (Exception e) when (Unreadable(e)) { return false; }
+    }
+
+    /// Waits (up to 2 s) while another app still has the file open for writing, like a screenshot tool saving it.
+    /// A half-written picture never matches its copy.
+    public static void WaitUntilWritten(string path)
+    {
+        for (var i = 0; i < 20; i++)
+        {
+            try { using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)) return; }
+            catch (IOException) when (System.IO.File.Exists(path)) { Thread.Sleep(100); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return; }
+        }
     }
 
     public static Stream OpenShared(string path) => new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
+    /// Decodes at most `px` on the longer side, so a huge picture shown small doesn't hold its full size in memory.
+    /// Also returns the full size.
+    public static (BitmapSource Image, Size Full) DecodeFit(string path, int px)
+    {
+        using var file = OpenShared(path);
+        var frame = BitmapDecoder.Create(file, BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.None).Frames[0];
+        file.Position = 0;
+        var image = new BitmapImage();
+        image.BeginInit();
+        image.StreamSource = file;
+        image.CacheOption = BitmapCacheOption.OnLoad;
+        image.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+        if (frame.PixelWidth >= frame.PixelHeight) image.DecodePixelWidth = Math.Min(px, frame.PixelWidth);
+        else image.DecodePixelHeight = Math.Min(px, frame.PixelHeight);
+        image.EndInit();
+        image.Freeze();
+        return (image, new Size(frame.PixelWidth, frame.PixelHeight));
+    }
+
+    /// Decodes through a stream that's closed right after. Decoding straight from a path leaves the file locked
+    /// until the next garbage collection when it fails, so a broken picture couldn't be deleted or renamed.
+    public static BitmapDecoder Decode(string path, BitmapCreateOptions options = BitmapCreateOptions.IgnoreColorProfile)
+    {
+        using var s = OpenShared(path);
+        return BitmapDecoder.Create(s, options, BitmapCacheOption.OnLoad);
+    }
 
     public static byte[] Png(BitmapSource image)
     {
@@ -159,7 +208,7 @@ sealed class Db : IDisposable
             var idx = i + 1;
             switch (args[i])
             {
-                case string v: sqlite3_bind_text16(s, idx, v, -1, Transient); break;
+                case string v: sqlite3_bind_text16(s, idx, v, v.Length * 2, Transient); break;   // explicit length keeps text after a NUL
                 case double v: sqlite3_bind_double(s, idx, v); break;
                 case long v: sqlite3_bind_int64(s, idx, v); break;
                 case int v: sqlite3_bind_int64(s, idx, v); break;
@@ -188,7 +237,7 @@ sealed class Db : IDisposable
         var s = Prepare("SELECT id,kind,text,file,source,created FROM clips " + tail, args);
         try
         {
-            string Col(int i) => Marshal.PtrToStringUni(sqlite3_column_text16(s, i)) ?? "";
+            string Col(int i) => sqlite3_column_text16(s, i) is var p && p != IntPtr.Zero ? Marshal.PtrToStringUni(p, sqlite3_column_bytes16(s, i) / 2) : "";
             var output = new List<Clip>();
             int rc;
             while ((rc = sqlite3_step(s)) == SQLITE_ROW)
@@ -251,14 +300,16 @@ sealed class Db : IDisposable
     /// A screenshot file just arrived: drop the copy of the same picture recorded moments ago.
     public void DropCopiesOf(string screenshot)
     {
-        foreach (var c in Select("WHERE kind = 'image' AND created >= ?", Now - ScreenshotWindow))
+        var copies = Select("WHERE kind = 'image' AND created >= ?", Now - ScreenshotWindow);
+        if (copies.Count > 0) Store.WaitUntilWritten(screenshot);
+        foreach (var c in copies)
             if (c.File is { } f && Store.SamePicture(() => Store.OpenShared(f), () => Store.OpenShared(screenshot))) Delete(c.Id);
     }
 
     /// A copied picture is a screenshot that was saved moments ago.
     public bool IsRecentScreenshot(byte[] png) =>
         Select("WHERE source = 'Screenshot' AND created >= ?", Now - ScreenshotWindow)
-            .Any(c => Store.SamePicture(() => new MemoryStream(png), () => Store.OpenShared(c.Text)));
+            .Any(c => { Store.WaitUntilWritten(c.Text); return Store.SamePicture(() => new MemoryStream(png), () => Store.OpenShared(c.Text)); });
 
     public void Delete(string hash) => DeleteWhere("WHERE hash = ?", hash);
     public void Delete(long id) => DeleteWhere("WHERE id = ?", id);
@@ -279,7 +330,7 @@ sealed class Db : IDisposable
     static void RemoveFiles(IEnumerable<Clip> clips)
     {
         foreach (var c in clips)
-            if (c.File is { } f && Path.GetDirectoryName(f) == Paths.Images) try { System.IO.File.Delete(f); } catch (IOException) { }
+            if (c.File is { } f && Path.GetDirectoryName(f) == Paths.Images) try { System.IO.File.Delete(f); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
     const int SQLITE_ROW = 100, SQLITE_DONE = 101, SQLITE_NULL = 5;
@@ -299,6 +350,7 @@ sealed class Db : IDisposable
     [DllImport("winsqlite3.dll")] static extern double sqlite3_column_double(IntPtr s, int i);
     [DllImport("winsqlite3.dll")] static extern IntPtr sqlite3_column_text16(IntPtr s, int i);
     [DllImport("winsqlite3.dll")] static extern int sqlite3_column_type(IntPtr s, int i);
+    [DllImport("winsqlite3.dll")] static extern int sqlite3_column_bytes16(IntPtr s, int i);
     [DllImport("winsqlite3.dll")] static extern IntPtr sqlite3_errmsg16(IntPtr db);
 }
 
@@ -319,7 +371,7 @@ static class Prefs
     };
 
     static readonly string File = Path.Combine(Paths.Dir, "prefs.json");
-    static Dictionary<string, object?> values = Load() ?? new();
+    static volatile Dictionary<string, object?> values = Load() ?? new();   // swapped whole; read from the writer thread too
 
     /// Null when the file can't be read right now; a missing file means defaults.
     static Dictionary<string, object?>? Load()
@@ -350,6 +402,42 @@ static class Prefs
     public static string HiddenSql => string.Concat(Categories.Where(c => !On(c.Key)).Select(c => $" AND NOT ({c.Sql})"));
 }
 
+/// Screenshots and downloads the user took out of history. Their files stay in the folder, so without this the
+/// backfill would add them right back. Only touched on the writer thread.
+sealed class Forgotten
+{
+    static readonly string File = Path.Combine(Paths.Dir, "forgotten.json");
+
+    /// Unix seconds of the last Clear all: files added before it stay out.
+    public long ClearedAt { get; set; }
+    /// Single files removed since, with when (dropped after 7 days, when the backfill no longer reaches them).
+    public Dictionary<string, long> Files { get; set; } = new();
+
+    public static Forgotten Load()
+    {
+        try { return System.IO.File.Exists(File) ? Store.Json.Deserialize<Forgotten>(Store.ReadText(File)) ?? new() : new(); }
+        catch (Exception e) when (e is IOException or ArgumentException or InvalidOperationException or UnauthorizedAccessException) { return new(); }
+    }
+
+    public bool Has(string path, DateTime added) => new DateTimeOffset(added).ToUnixTimeSeconds() <= ClearedAt || Files.ContainsKey(path);
+
+    public static void Remove(Clip c)
+    {
+        if (c.Source is "Screenshot" or "Downloads") Save(f => f.Files[c.Text] = DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+    }
+
+    public static void ClearAll() => Save(f => { f.ClearedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); f.Files.Clear(); });
+
+    static void Save(Action<Forgotten> change)
+    {
+        var f = Load();
+        change(f);
+        var cutoff = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (long)Db.Retention;
+        f.Files = f.Files.Where(p => p.Value >= cutoff).ToDictionary(p => p.Key, p => p.Value);
+        Store.WriteAtomic(File, Encoding.UTF8.GetBytes(Store.Json.Serialize(f)));
+    }
+}
+
 /// Writes clips back to the Windows clipboard.
 static class Board
 {
@@ -361,25 +449,31 @@ static class Board
         try
         {
             if (Path.GetExtension(path).Equals(".png", StringComparison.OrdinalIgnoreCase)) return System.IO.File.ReadAllBytes(path);
-            return Store.Png(BitmapDecoder.Create(new Uri(path), BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0]);
+            return Store.Png(Store.Decode(path, BitmapCreateOptions.None).Frames[0]);
         }
-        catch (Exception e) when (e is IOException or NotSupportedException or UnauthorizedAccessException or ArgumentException) { return null; }
+        catch (Exception e) when (Store.Unreadable(e)) { return null; }
     }
 
-    public static void Write(Clip c)
+    /// Null once it's on the clipboard, otherwise why it isn't. Pasting then would paste whatever was there before.
+    public static string? Write(Clip c)
     {
-        switch (c.Kind)
+        var data = c.Kind switch
         {
-            case ClipKind.Text: WriteText(c.Text); break;
-            case ClipKind.Image:
-                if (c.File is { } f && PngData(f) is { } d) Set(ImageData(d));
-                break;
-            default: WriteFiles(c.Paths); break;
-        }
+            ClipKind.Text => TextData(c.Text),
+            ClipKind.Image => c.File is { } f && PngData(f) is { } png ? ImageData(png) : null,
+            _ => FilesData(c.Paths),
+        };
+        if (data == null) return "Its image file is gone or can't be read.";
+        try { Set(data); return null; }
+        catch (ExternalException) { return "Another app is using the clipboard. Try again in a moment."; }   // past WPF's own retries
     }
 
     /// `transient` marks it so clipboard managers (ClipBubble included) and Windows' own history don't save it.
-    public static void WriteText(string s, bool transient = false)
+    public static void WriteText(string s, bool transient = false) => Set(TextData(s, transient));
+
+    public static void WriteFiles(IReadOnlyList<string> paths) => Set(FilesData(paths));
+
+    static DataObject TextData(string s, bool transient = false)
     {
         var data = new DataObject();
         data.SetText(s, TextDataFormat.UnicodeText);
@@ -388,32 +482,32 @@ static class Board
             data.SetData(ExcludeFormat, new MemoryStream(new byte[4]));
             data.SetData("CanIncludeInClipboardHistory", new MemoryStream(new byte[4]));
         }
-        Set(data);
+        return data;
     }
 
     /// A single image file goes on as both the file and its pixels, so it pastes into Explorer and into chat/web apps.
-    public static void WriteFiles(IReadOnlyList<string> paths)
+    static DataObject FilesData(IReadOnlyList<string> paths)
     {
-        var data = paths.Count == 1 && Store.IsImagePath(paths[0]) && PngData(paths[0]) is { } d ? ImageData(d) : new DataObject();
+        var data = (paths.Count == 1 && Store.IsImagePath(paths[0]) && PngData(paths[0]) is { } png ? ImageData(png) : null) ?? new DataObject();
         var list = new StringCollection();
         list.AddRange(paths.ToArray());
         data.SetFileDropList(list);
-        Set(data);
+        return data;
     }
 
-    /// PNG keeps transparency for apps that read it; the bitmap is for everything else. Unreadable pixels (a file
-    /// still being written) just leave the data without an image.
-    static DataObject ImageData(byte[] png)
+    /// PNG keeps transparency for apps that read it; the bitmap is for everything else. Null when the pixels can't
+    /// be read (a file still being written).
+    static DataObject? ImageData(byte[] png)
     {
-        var data = new DataObject();
         try
         {
             var frame = BitmapFrame.Create(new MemoryStream(png), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+            var data = new DataObject();
             data.SetData("PNG", new MemoryStream(png));
             data.SetImage(frame);
+            return data;
         }
-        catch (Exception e) when (e is NotSupportedException or FileFormatException or ArgumentException) { }
-        return data;
+        catch (Exception e) when (Store.Unreadable(e)) { return null; }
     }
 
     /// WPF already retries for about a second if another app holds the clipboard. `copy` keeps the data after we exit.

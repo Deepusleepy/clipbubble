@@ -16,23 +16,52 @@ namespace ClipBubble;
 /// What was on the clipboard, copied out while it was open. Decoding and hashing happen later, off the UI thread.
 sealed record Snapshot(string[] Files, string? Text, byte[]? Png, byte[]? Dib);
 
-/// Listens for clipboard changes and records each one once it has settled. Everything that writes capture history
-/// (copies, new screenshots and downloads, the 7-day backfill) runs in order on one background queue, so the UI
-/// never waits on it and a screenshot's copy and its saved file are always handled one after the other.
+/// Everything that writes history (copies, new screenshots and downloads, the 7-day backfill, deletes and cleanup)
+/// runs in order on this one background queue, so the UI never waits on the database or the disk, and a screenshot's
+/// copy and its saved file are always handled one after the other.
+sealed class Writer
+{
+    /// Its own connection: the UI's reads don't wait for a write in progress.
+    public readonly Db Db = new();
+    readonly Dispatcher ui = Dispatcher.CurrentDispatcher;
+    Task chain = Task.CompletedTask;
+
+    /// Runs `work` after everything queued before it, then `done` on the UI thread if `work` returned true.
+    public void Run(Func<bool> work, Action done)
+    {
+        chain = chain.ContinueWith(_ =>
+        {
+            try { if (work()) ui.BeginInvoke(done); }
+            catch (Exception e) { Log.Error(e); }   // e.g. the database stayed locked: this item is lost, the next one isn't
+        }, TaskScheduler.Default);
+    }
+
+    /// A delete or cleanup. `then` runs on the UI thread even if it failed, so a view that re-reads shows what's really stored.
+    public void Write(Action<Db> write, Action? then = null) =>
+        Run(() =>
+        {
+            try { write(Db); }
+            catch (Exception e) { Log.Error(e); }
+            return true;
+        }, then ?? delegate { });
+}
+
+/// Listens for clipboard changes and records each one, on the writer, once it has settled.
 sealed class Capture : IDisposable
 {
     readonly HwndSource listener;
     readonly DispatcherTimer settle = new() { Interval = TimeSpan.FromSeconds(0.6) };
-    readonly Recorder recorder = new();
+    readonly Writer writer;
+    readonly Recorder recorder;
     readonly Action onChange;
-    readonly Dispatcher ui = Dispatcher.CurrentDispatcher;
-    Task chain = Task.CompletedTask;
     uint seen, handled;
     (string Name, bool Ours) source = ("", false);
     int busyRetries;
 
-    public Capture(Action onChange)
+    public Capture(Writer writer, Action onChange)
     {
+        this.writer = writer;
+        recorder = new Recorder(writer.Db);
         this.onChange = onChange;
         handled = seen = GetClipboardSequenceNumber();
         listener = new HwndSource(new HwndSourceParameters("ClipBubble clipboard") { ParentWindow = new IntPtr(-3) });   // message-only
@@ -71,22 +100,13 @@ sealed class Capture : IDisposable
         catch (COMException) { handled = seen; return; }
         handled = seen;
         if (data == null || Read(data) is not { } snapshot) return;
-        var from = source;
-        Queue(() => recorder.Record(snapshot, from.Name, DateTime.Now, from.Ours), onChange);
+        var (from, at) = (source, DateTime.Now);   // when it was copied, not when the writer gets to it
+        writer.Run(() => recorder.Record(snapshot, from.Name, at, from.Ours), onChange);
     }
 
-    /// Adds files from a watched folder (`files` is listed on the queue too, so a big backfill never blocks the UI).
+    /// Adds files from a watched folder (`files` is listed on the writer too, so a big backfill never blocks the UI).
     public void AddFiles(string source, Func<IEnumerable<(string Path, DateTime Added)>> files, Action done) =>
-        Queue(() => { foreach (var (path, added) in files()) recorder.AddFile(path, source, added); return true; }, done);
-
-    void Queue(Func<bool> work, Action done)
-    {
-        chain = chain.ContinueWith(_ =>
-        {
-            try { if (work()) ui.BeginInvoke(done); }
-            catch (Exception e) { Log.Error(e); }   // e.g. the database stayed locked: this item is lost, the next one isn't
-        }, TaskScheduler.Default);
-    }
+        writer.Run(() => { foreach (var (path, added) in files()) recorder.AddFile(path, source, added); return true; }, done);
 
     /// Copies the formats we care about. Copies marked as secret by password managers are never read.
     internal static Snapshot? Read(IDataObject data)
@@ -121,9 +141,8 @@ sealed class Capture : IDisposable
 
 /// Turns settled clipboard snapshots into history rows, and spots tools that paste through the clipboard.
 /// Runs on one background thread at a time.
-sealed class Recorder
+sealed class Recorder(Db db)
 {
-    readonly Db db = new();
     /// The latest capture and the one before it, to spot tools that paste through the clipboard.
     (string Hash, DateTime At, bool Inserted)? last;
     string? previousHash;
@@ -140,7 +159,7 @@ sealed class Recorder
     public bool Record(Snapshot s, string source, DateTime now, bool ours = false)
     {
         if (Classify(s) is not { } clip) return false;
-        if (clip.Hash == last?.Hash) return false;
+        if (clip.Hash == last?.Hash && db.Exists(clip.Hash)) return false;   // copied again after a delete: save it again
         var category = clip.Kind switch { ClipKind.Image => "images", ClipKind.File => "files", _ => "text" };
         if (!Prefs.On(category)) return false;
 
@@ -209,7 +228,7 @@ sealed class Recorder
         {
             return Store.Png(BitmapDecoder.Create(new MemoryStream(file), BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0]);
         }
-        catch (Exception e) when (e is NotSupportedException or FileFormatException or ArgumentException or IOException) { return null; }
+        catch (Exception e) when (Store.Unreadable(e)) { return null; }
     }
 }
 
@@ -320,7 +339,9 @@ sealed class FolderWatcher : IDisposable
     readonly Action<string, DateTime> onNew;
     readonly DispatcherTimer debounce = new() { Interval = TimeSpan.FromSeconds(0.4) };
     readonly DispatcherTimer retry = new() { Interval = TimeSpan.FromSeconds(5) };
-    HashSet<string> known = new();
+    /// Null while a folder that exists can't be listed yet, so a listing that fails never makes everything look new.
+    /// A folder that doesn't exist yet starts empty: everything saved into it later is new.
+    HashSet<string>? known;
     FileSystemWatcher? watcher;
     bool stopped;
 
@@ -333,7 +354,8 @@ sealed class FolderWatcher : IDisposable
         this.onNew = onNew;
         debounce.Tick += (_, _) => { debounce.Stop(); Scan(); };
         retry.Tick += (_, _) => Start();
-        if (Directory.Exists(folder)) known = new HashSet<string>(Listing());
+        if (!Directory.Exists(folder)) known = new();
+        else if (Listing() is { } now) known = new(now);
         Start();
     }
 
@@ -374,10 +396,11 @@ sealed class FolderWatcher : IDisposable
     public IEnumerable<(string Path, DateTime Added)> Existing(double days)
     {
         var cutoff = DateTime.Now.AddDays(-days);
-        return Listing().Select(p => (p, Added(p))).Where(x => x.Item2 > cutoff).ToList();
+        return (Listing() ?? new()).Select(p => (p, Added(p))).Where(x => x.Item2 > cutoff).ToList();
     }
 
-    List<string> Listing()
+    /// Null when the folder can't be listed right now (gone, no access, a network share not answering).
+    List<string>? Listing()
     {
         try
         {
@@ -385,14 +408,13 @@ sealed class FolderWatcher : IDisposable
                 .Where(i => (i.Attributes & FileAttributes.Hidden) == 0)
                 .Select(i => i.FullName).Where(include).ToList();
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return new(); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
     }
 
     void Scan()
     {
-        if (stopped) return;
-        var now = Listing();
-        var fresh = now.Where(p => !known.Contains(p)).ToList();
+        if (stopped || Listing() is not { } now) return;
+        var fresh = known == null ? new List<string>() : now.Where(p => !known.Contains(p)).ToList();
         known = new HashSet<string>(now);
         DateTime? cutoff = maxAge.HasValue ? DateTime.Now.AddSeconds(-maxAge.Value) : null;
         foreach (var path in fresh.OrderBy(Added))

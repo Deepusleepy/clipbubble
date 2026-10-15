@@ -111,7 +111,8 @@ static class Mascots
             if (!(c == '-' && slug.Length > 0 && slug[slug.Length - 1] == '-')) slug.Append(c);
         }
         var b = slug.ToString().Trim('-');
-        string id = b.Length == 0 ? "mascot" : b;
+        if (b.Length == 0) b = "mascot";
+        var id = b;
         var taken = new HashSet<string>(All().Select(m => m.Id));
         for (var n = 2; taken.Contains(id); n++) id = $"{b}-{n}";
 
@@ -134,7 +135,11 @@ static class Mascots
                     file = $"{id}-{state}{Path.GetExtension(src).ToLowerInvariant()}";
                     File.Copy(src, Path.Combine(Dir, file), overwrite: true);
                 }
-                if (Glyphs.Load(Url(file), 34) == null) throw new MascotException($"couldn't read the {state} image; use PNG, GIF, JPG or SVG");
+                if (Glyphs.Load(Url(file), 34) == null)
+                {
+                    File.Delete(Path.Combine(Dir, file));
+                    throw new MascotException($"couldn't read the {state} image; use PNG, GIF, JPG or SVG");
+                }
                 value = file;
             }
             values[state] = value!;
@@ -372,7 +377,7 @@ sealed class GifPlayer
     {
         try
         {
-            var decoder = new GifBitmapDecoder(new Uri(path), BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+            var decoder = Store.Decode(path, BitmapCreateOptions.PreservePixelFormat);
             if (decoder.Frames.Count == 0) return null;
             int w = decoder.Metadata?.GetQuery("/logscrdesc/Width") is ushort lw ? lw : decoder.Frames[0].PixelWidth;
             int h = decoder.Metadata?.GetQuery("/logscrdesc/Height") is ushort lh ? lh : decoder.Frames[0].PixelHeight;
@@ -402,7 +407,7 @@ sealed class GifPlayer
             }
             return (frames.ToArray(), delays.ToArray());
         }
-        catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException or OutOfMemoryException) { return null; }
+        catch (Exception e) when (Store.Unreadable(e)) { return null; }
     }
 
     public void Play()
@@ -440,11 +445,9 @@ static unsafe class Glyphs
         try
         {
             if (path.EndsWith(".svg", StringComparison.OrdinalIgnoreCase)) return DrawSvg(File.ReadAllBytes(path), (int)(size * Scale));
-            var img = BitmapFrame.Create(new Uri(path), BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad);
-            img.Freeze();
-            return img;
+            return Store.DecodeFit(path, (int)(size * Scale)).Image;
         }
-        catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException) { return null; }
+        catch (Exception e) when (Store.Unreadable(e)) { return null; }
     });
 
     static long SafeStamp(string path) { try { return File.GetLastWriteTimeUtc(path).Ticks; } catch (Exception) { return 0; } }

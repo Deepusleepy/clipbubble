@@ -47,6 +47,7 @@ static class Program
     {
         using (var db = new Db()) db.DeleteAll();
         foreach (var c in Prefs.Categories) Prefs.SetOn(c.Key, true);
+        File.Delete(Path.Combine(Paths.Dir, "forgotten.json"));
         if (Directory.Exists(Mascots.Dir)) Directory.Delete(Mascots.Dir, true);
         Mascots.SetActive("blob");
     }
@@ -134,7 +135,7 @@ static class Program
 
         ("recorder: text, duplicate, and a paste-through rollback", () =>
         {
-            var r = new Recorder();
+            var r = new Recorder(new Db());
             var t0 = DateTime.Now;
             Check(r.Record(Text("A"), "Notepad", t0), "A recorded");
             Check(!r.Record(Text("A"), "Notepad", t0.AddSeconds(1)), "same again ignored");
@@ -150,7 +151,7 @@ static class Program
         {
             using var db = new Db();
             db.Upsert(ClipKind.Text, "B", null, "Notepad", "t:" + Store.Sha("B"));
-            var r = new Recorder();
+            var r = new Recorder(new Db());
             var t0 = DateTime.Now;
             r.Record(Text("A"), "Notepad", t0);
             r.Record(Text("B"), "Notepad", t0.AddSeconds(1));
@@ -164,7 +165,7 @@ static class Program
         ("recorder: files first, URL+image is an image, text+image is text, blank is nothing", () =>
         {
             var png = TinyPng();
-            var r = new Recorder();
+            var r = new Recorder(new Db());
             r.Record(new Snapshot(new[] { @"C:\a.txt", @"C:\b.txt" }, "ignored", png, null), "Explorer", DateTime.Now);
             r.Record(new Snapshot(Array.Empty<string>(), "https://example.com/cat.png", png, null), "Edge", DateTime.Now.AddSeconds(10));
             r.Record(new Snapshot(Array.Empty<string>(), "a caption", TinyPng(2), null), "Word", DateTime.Now.AddSeconds(20));
@@ -179,7 +180,7 @@ static class Program
 
         ("recorder: a 24-bit clipboard bitmap (DIB) becomes a PNG", () =>
         {
-            var r = new Recorder();
+            var r = new Recorder(new Db());
             Check(r.Record(new Snapshot(Array.Empty<string>(), null, null, Dib24(3, 2)), "Paint", DateTime.Now), "recorded");
             using var db = new Db();
             var img = db.Clips().Single();
@@ -202,7 +203,7 @@ static class Program
 
         ("a delete that fails on a locked database keeps the clip's image", () =>
         {
-            var r = new Recorder();
+            var r = new Recorder(new Db());
             r.Record(new Snapshot(Array.Empty<string>(), null, TinyPng(7), null), "Paint", DateTime.Now);
             using var db = new Db();
             var clip = db.Clips().Single();
@@ -240,7 +241,7 @@ static class Program
         ("recorder: switched-off kinds aren't saved", () =>
         {
             Prefs.SetOn("text", false);
-            Check(!new Recorder().Record(Text("nope"), "Notepad", DateTime.Now), "skipped");
+            Check(!new Recorder(new Db()).Record(Text("nope"), "Notepad", DateTime.Now), "skipped");
             using var db = new Db();
             Check(Sql.Query(Paths.Db, "SELECT count(*) FROM clips")[0] == "0", "nothing stored");
         }),
@@ -249,7 +250,7 @@ static class Program
         {
             using (new Db()) { }
             Sql.Exec(Paths.Db, "CREATE TRIGGER refuse BEFORE INSERT ON clips BEGIN SELECT RAISE(ABORT, 'disk full'); END");
-            var r = new Recorder();
+            var r = new Recorder(new Db());
             var threw = false;
             try { r.Record(Text("important"), "Notepad", DateTime.Now); } catch (InvalidOperationException) { threw = true; }
             Sql.Exec(Paths.Db, "DROP TRIGGER refuse");
@@ -371,13 +372,13 @@ static class Program
             File.WriteAllBytes(shot, TinyPng(3));
             var reencoded = Reencode(TinyPng(3));
             using var db = new Db();
-            var r = new Recorder();
+            var r = new Recorder(new Db());
             r.AddFile(shot, "Screenshot", DateTime.Now);
             Check(!r.Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now), "copy after the file is skipped");
             Check(db.Clips().Count == 1, "file first: one row");
 
             db.DeleteAll();
-            r = new Recorder();
+            r = new Recorder(new Db());
             r.Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now);
             r.AddFile(shot, "Screenshot", DateTime.Now);
             Check(db.Clips().Single().Source == "Screenshot", "copy first: the file's row replaces it");
@@ -412,6 +413,324 @@ static class Program
             Check(Enumerable.Range(0, 100).Any(i => bouncy.Ease(i / 100.0) > 1.05), "overshoots");
             var stiff = new SpringEase(0.2, 1);
             Check(Enumerable.Range(0, 100).All(i => stiff.Ease(i / 100.0) <= 1.0001), "critically damped never overshoots");
+        }),
+
+        ("a picture that fails to decode in an unexpected way still finishes loading", () =>
+        {
+            var broken = Path.Combine(Paths.Dir, "broken-" + Guid.NewGuid().ToString("N").Substring(0, 6) + ".webp");
+            File.WriteAllBytes(broken, BrokenWebp());
+            var calls = 0;
+            Thumbs.Load(broken, 64, _ => calls++);
+            Snapshots.Pump(1);
+            Thumbs.Load(broken, 64, _ => calls++);
+            Snapshots.Pump(1);
+            Check(calls == 2, $"{calls} of 2 callbacks ran; a stuck decode leaves the row blank until a restart");
+        }),
+
+        ("a broken WebP doesn't break copies, agents or mascots", () =>
+        {
+            var broken = Path.Combine(Paths.Dir, "Screenshot broken.webp");
+            File.WriteAllBytes(broken, BrokenWebp());
+            using var db = new Db();
+            var r = new Recorder(db);
+            r.AddFile(broken, "Screenshot", DateTime.Now);
+            Check(r.Record(new Snapshot(Array.Empty<string>(), null, TinyPng(9), null), "Paint", DateTime.Now), "a picture copied right after is still saved");
+            var id = db.Clips(kind: ClipKind.Image).Single(c => c.Source == "Screenshot").Id;
+            var got = ClipBubble.Mcp.Call(db, "clipboard_get", new Dictionary<string, object?> { ["id"] = id });
+            Check(((System.Collections.IList)got["content"]).Count == 1, "clipboard_get returns the item without an image");
+            string Err(Action a) { try { a(); return ""; } catch (MascotException e) { return e.Message; } }
+            Check(Err(() => Mascots.Add("Broken", "image", null, new() { ["idle"] = broken })).StartsWith("couldn't read the idle image"), "mascot_add explains");
+            Check(!File.Exists(Path.Combine(Mascots.Dir, "broken-idle.webp")), "and leaves no copy of the file behind");
+        }),
+
+        ("an image whose file is gone is never pasted as whatever was copied before", () =>
+        {
+            var gone = new Clip(1, ClipKind.Image, "", Path.Combine(Paths.Images, "gone.png"), "Paint", DateTime.Now);
+            Check(Board.Write(gone) == "Its image file is gone or can't be read.", "missing file: nothing written, so no paste");
+            var junk = Path.Combine(Paths.Images, "junk.png");
+            File.WriteAllBytes(junk, new byte[] { 1, 2, 3 });
+            Check(Board.Write(gone with { File = junk }) != null, "unreadable file: same");
+            var broken = Path.Combine(Paths.Dir, "broken.webp");
+            File.WriteAllBytes(broken, BrokenWebp());
+            Check(Board.Write(gone with { File = broken }) != null, "broken WebP: same");
+            File.Delete(broken);   // throws if the failed read left the user's file locked
+            using var db = new Db();
+            Sql.Exec(Paths.Db, $"INSERT INTO clips(kind,text,file,source,hash,created) VALUES('image','','{gone.File}','Paint','i:gone',{DateTimeOffset.UtcNow.ToUnixTimeSeconds()})");
+            var reply = ClipBubble.Mcp.Call(db, "clipboard_set", new Dictionary<string, object?> { ["id"] = db.Clips().Single().Id });
+            Check(reply["isError"] is true, "clipboard_set tells the agent it didn't copy");
+        }),
+
+        ("auto-paste waits for the app, and never pastes after the clipboard changed", () =>
+        {
+            static bool Paste(Func<bool> ready, Func<bool> stillOurs, Func<bool> send, double timeout = 1.5) =>
+                System.Threading.Tasks.Task.Run(() => Win.PasteWhenReady(ready, stillOurs, send, timeout)).Result;
+            var polls = 0;
+            var sent = 0;
+            Check(Paste(() => ++polls >= 5, () => true, () => { sent++; return true; }) && sent == 1, $"pasted once the app was ready (sent {sent})");
+            Check(polls == 5, $"checked {polls} times before pasting");
+            sent = 0;
+            var watch = Stopwatch.StartNew();
+            Check(!Paste(() => false, () => true, () => { sent++; return true; }, timeout: 0.2) && sent == 0, "app never came back: no paste");
+            Check(watch.Elapsed.TotalSeconds < 1, $"gave up after {watch.Elapsed.TotalSeconds:0.00} s");
+            Check(!Paste(() => true, () => false, () => { sent++; return true; }) && sent == 0, "clipboard replaced meanwhile: no paste");
+            Check(!Paste(() => true, () => true, () => false), "keystrokes refused: reported");
+        }),
+
+        ("deleting a clip or clearing history never waits on the database", () =>
+        {
+            using var db = new Db();
+            db.Upsert(ClipKind.Text, "keep", null, "Notepad", "t:keep");
+            db.Upsert(ClipKind.Text, "drop", null, "Notepad", "t:drop");
+            var model = new Model();
+            model.Refresh();
+            var held = Sql.Hold(Paths.Db, "BEGIN IMMEDIATE");   // another app in the middle of a write
+            var watch = Stopwatch.StartNew();
+            model.Delete(model.Clips.Single(c => c.Text == "drop"));
+            Check(watch.ElapsedMilliseconds < 200, $"delete returned in {watch.ElapsedMilliseconds} ms");
+            Check(model.Clips.Select(c => c.Text).SequenceEqual(new[] { "keep" }), "gone from the list at once");
+            held.Dispose();
+            Snapshots.Pump(0.5);
+            Check(db.Clips().Select(c => c.Text).SequenceEqual(new[] { "keep" }), "deleted for real");
+            Check(model.Recent.All(c => c.Text != "drop"), "and from the recent three");
+
+            held = Sql.Hold(Paths.Db, "BEGIN IMMEDIATE");
+            watch.Restart();
+            model.ClearAll();
+            Check(watch.ElapsedMilliseconds < 200, $"clear all returned in {watch.ElapsedMilliseconds} ms");
+            held.Dispose();
+            Snapshots.Pump(0.5);
+            Check(model.Clips.Count == 0 && db.Clips().Count == 0, "everything cleared");
+        }),
+
+        ("a delete that fails shows the clip again", () =>
+        {
+            using (var db = new Db()) db.Upsert(ClipKind.Text, "stuck", null, "Notepad", "t:stuck");
+            var model = new Model();
+            model.Refresh();
+            using (Sql.Hold(Paths.Db, "BEGIN IMMEDIATE"))
+            {
+                model.Delete(model.Clips.Single());
+                Check(model.Clips.Count == 0, "hidden while deleting");
+                Snapshots.Pump(3.5);   // past the 3 s busy timeout
+            }
+            Check(model.Clips.Count == 1 && model.Recent.Count == 1, "back in the list, because it's still stored");
+        }),
+
+        ("a setting that can't be saved stays as it was and says why", () =>
+        {
+            var model = new Model();
+            string? error = null;
+            model.ShowError = (title, _) => error = title;
+            var settings = new SettingsView(model, TestApp.Value);
+            var textSwitch = Descendants(settings).OfType<System.Windows.Controls.Border>().First(b => b.Width == 26 && b.Height == 15);
+            using (new FileStream(Path.Combine(Paths.Dir, "prefs.json"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                Click(textSwitch);
+            Check(error == "Couldn't save that setting", "said why: " + error);
+            Check(Prefs.On("text") && textSwitch.Background == UI.AccentBrush, "the setting and its switch are still on");
+            Check(Directory.GetFiles(Paths.Dir, "*.tmp").Length == 0, "no temp file left behind");
+            Click(textSwitch);
+            Check(!Prefs.On("text") && textSwitch.Background != UI.AccentBrush, "works once the file is free");
+        }),
+
+        ("a row picked with the keyboard keeps its highlight when the mouse leaves it", () =>
+        {
+            using (var db = new Db()) { db.Upsert(ClipKind.Text, "one", null, "Notepad", "t:one"); db.Upsert(ClipKind.Text, "two", null, "Notepad", "t:two"); }
+            var model = new Model();
+            model.Refresh();
+            var second = model.Clips[1];
+            var row = new Row(second, 1, isSelected: false, model);
+            var host = new Window { Content = row, Left = -20000, Top = -20000, ShowActivated = false, ShowInTaskbar = false, WindowStyle = WindowStyle.None, SizeToContent = SizeToContent.WidthAndHeight };
+            host.Show();
+            try
+            {
+                model.Selection = second.Id;
+                var selected = ((SolidColorBrush)row.Background).Color;
+                row.RaiseEvent(new System.Windows.Input.MouseEventArgs(System.Windows.Input.Mouse.PrimaryDevice, 0) { RoutedEvent = System.Windows.Input.Mouse.MouseLeaveEvent });
+                Check(row.Background is SolidColorBrush b && b.Color == selected && selected.A > 0, "still highlighted");
+            }
+            finally { host.Close(); }
+        }),
+
+        ("copying something again right after deleting it saves it again", () =>
+        {
+            using var db = new Db();
+            var r = new Recorder(db);
+            r.Record(Text("again"), "Notepad", DateTime.Now);
+            db.Delete(db.Clips().Single().Id);
+            Check(r.Record(Text("again"), "Notepad", DateTime.Now.AddSeconds(5)), "recorded");
+            Check(db.Clips().Single().Text == "again", "back in history");
+        }),
+
+        ("text with a NUL character is stored whole", () =>
+        {
+            using var db = new Db();
+            db.Upsert(ClipKind.Text, "before\0after", null, "Notepad", "t:nul");
+            Check(db.Clips().Single().Text == "before\0after", "read back: " + db.Clips().Single().Text.Replace("\0", "\\0"));
+        }),
+
+        ("clearing history doesn't stop at a read-only image", () =>
+        {
+            using var db = new Db();
+            var r = new Recorder(db);
+            r.Record(new Snapshot(Array.Empty<string>(), null, TinyPng(11), null), "Paint", DateTime.Now);
+            r.Record(new Snapshot(Array.Empty<string>(), null, TinyPng(12), null), "Paint", DateTime.Now.AddSeconds(5));
+            var files = db.Clips().Select(c => c.File!).ToList();
+            File.SetAttributes(files[0], FileAttributes.ReadOnly);
+            try
+            {
+                db.DeleteAll();
+                Check(db.Clips().Count == 0, "rows gone");
+                Check(!File.Exists(files[1]), "the other image was still deleted");
+            }
+            finally { File.SetAttributes(files[0], FileAttributes.Normal); }
+        }),
+
+        ("a mascot named only with symbols gets a readable id", () =>
+        {
+            Check(Mascots.Add("!!!", "emoji", null, new() { ["idle"] = "🐸" }).Id == "mascot", "first");
+            Check(Mascots.Add("???", "emoji", null, new() { ["idle"] = "🐸" }).Id == "mascot-2", "second, not \"-2\"");
+        }),
+
+        ("a big picture mascot is decoded at the size it's shown", () =>
+        {
+            var big = Path.Combine(Paths.Dir, "big.png");
+            var px = new byte[2000 * 1000 * 4];
+            for (var i = 0; i < px.Length; i += 4) { px[i] = 200; px[i + 1] = 90; px[i + 2] = 40; px[i + 3] = 255; }
+            var enc = new PngBitmapEncoder();
+            enc.Frames.Add(BitmapFrame.Create(BitmapSource.Create(2000, 1000, 96, 96, PixelFormats.Bgra32, null, px, 2000 * 4)));
+            using (var f = File.Create(big)) enc.Save(f);
+            var img = Glyphs.Load(big, 34);
+            Check(img != null && img.PixelWidth <= 102 && img.PixelHeight <= 51, $"decoded at {img?.PixelWidth}x{img?.PixelHeight} to show at 34 px");
+        }),
+
+        ("removed screenshots and downloads stay out of history", () =>
+        {
+            var shot = Path.Combine(Paths.Dir, "Screenshot 2.png");
+            var download = Path.Combine(Paths.Dir, "report.pdf");
+            File.WriteAllBytes(shot, TinyPng());
+            File.WriteAllText(download, "%PDF");
+            using (var db = new Db())
+            {
+                db.InsertIfMissing(ClipKind.File, shot, "Screenshot", "f:" + Store.Sha(shot), DateTime.Now);
+                db.InsertIfMissing(ClipKind.File, download, "Downloads", "f:" + Store.Sha(download), DateTime.Now);
+            }
+            var model = new Model();
+            model.Refresh();
+            model.Delete(model.Clips.Single(c => c.Source == "Screenshot"));
+            Snapshots.Pump(0.5);
+            var gone = Forgotten.Load();
+            Check(gone.Has(shot, DateTime.Now) && !gone.Has(download, DateTime.Now.AddMinutes(-1)), "the removed screenshot is skipped, the download isn't");
+            model.ClearAll();
+            Snapshots.Pump(0.5);
+            gone = Forgotten.Load();
+            Check(gone.Has(download, DateTime.Now.AddMinutes(-1)), "after Clear all, files from before it are skipped");
+            Check(!gone.Has(Path.Combine(Paths.Dir, "new.png"), DateTime.Now.AddMinutes(1)), "files added later still come in");
+        }),
+
+        ("a folder that briefly can't be read doesn't make old files look new", () =>
+        {
+            var folder = Path.Combine(Paths.Dir, "watched-" + Guid.NewGuid().ToString("N").Substring(0, 6));
+            Directory.CreateDirectory(folder);
+            File.WriteAllText(Path.Combine(folder, "old.pdf"), "x");
+            var seen = new List<string>();
+            using var watcher = new FolderWatcher(folder, null, _ => true, (path, _) => seen.Add(Path.GetFileName(path)));
+            var dir = new DirectoryInfo(folder);
+            var deny = new System.Security.AccessControl.FileSystemAccessRule(System.Security.Principal.WindowsIdentity.GetCurrent().User!,
+                System.Security.AccessControl.FileSystemRights.ListDirectory, System.Security.AccessControl.AccessControlType.Deny);
+            var acl = dir.GetAccessControl();
+            acl.AddAccessRule(deny);
+            dir.SetAccessControl(acl);
+            try
+            {
+                File.WriteAllText(Path.Combine(folder, "during.pdf"), "x");   // noticed, but the folder can't be listed
+                Snapshots.Pump(1);
+            }
+            finally
+            {
+                acl.RemoveAccessRule(deny);
+                dir.SetAccessControl(acl);
+            }
+            File.WriteAllText(Path.Combine(folder, "after.pdf"), "x");
+            Snapshots.Pump(1);
+            Check(!seen.Contains("old.pdf"), "old file not reported as new: " + string.Join(",", seen));
+            Check(seen.Contains("during.pdf") && seen.Contains("after.pdf"), "new files still reported: " + string.Join(",", seen));
+        }),
+
+        ("a thumbnail that failed while its file was still saving loads once it's saved", () =>
+        {
+            var shot = Path.Combine(Paths.Dir, "saving-" + Guid.NewGuid().ToString("N").Substring(0, 6) + ".png");
+            File.WriteAllBytes(shot, TinyPng().Take(20).ToArray());
+            BitmapSource? first = null, second = null;
+            Thumbs.Load(shot, 64, b => first = b);
+            Snapshots.Pump(0.5);
+            File.WriteAllBytes(shot, TinyPng());
+            Thumbs.Load(shot, 64, b => second = b);
+            Snapshots.Pump(0.5);
+            Check(first == null && second != null, "loaded on the second try");
+        }),
+
+        ("the home folder shortens to ~ only for paths inside it", () =>
+        {
+            Check(UI.Tilde(@"C:\Users\Ann\notes.txt", @"C:\Users\Ann") == @"~\notes.txt", "inside");
+            Check(UI.Tilde(@"C:\Users\Anna\notes.txt", @"C:\Users\Ann") == @"C:\Users\Anna\notes.txt", "a neighbor that starts the same");
+            Check(UI.Tilde(@"C:\Users\Ann", @"C:\Users\Ann") == "~", "the folder itself");
+        }),
+
+        ("a screenshot still being saved is compared once it's done", () =>
+        {
+            var shot = Path.Combine(Paths.Dir, "Screenshot 3.png");
+            var png = TinyPng(4);
+            using var db = new Db();
+            var r = new Recorder(db);
+            r.Record(new Snapshot(Array.Empty<string>(), null, Reencode(png), null), "Snipping Tool", DateTime.Now);
+            var saving = new FileStream(shot, FileMode.Create, FileAccess.Write, FileShare.Read);
+            var add = System.Threading.Tasks.Task.Run(() => r.AddFile(shot, "Screenshot", DateTime.Now));
+            Thread.Sleep(400);
+            saving.Write(png, 0, png.Length);
+            saving.Dispose();
+            Check(add.Wait(5000), "finished");
+            Check(db.Clips().Count == 1 && db.Clips()[0].Source == "Screenshot", "one row: " + string.Join(", ", db.Clips().Select(c => c.Source)));
+        }),
+
+        ("a new search shows its results from the top; a delete keeps the list where it was", () =>
+        {
+            using (var db = new Db())
+                for (var i = 0; i < 60; i++) db.InsertIfMissing(ClipKind.Text, "item " + i, "Notepad", "t:item" + i, DateTime.Now.AddMinutes(-i));
+            var model = new Model();
+            model.Refresh();
+            var panel = new PanelView(model, () => new SettingsView(model, TestApp.Value));
+            var host = new Window { Content = panel, Width = 420, Height = 470, Left = -20000, Top = -20000, ShowActivated = false, ShowInTaskbar = false, WindowStyle = WindowStyle.None };
+            host.Show();
+            Snapshots.Pump(0.3);
+            try
+            {
+                var list = Visuals(panel).OfType<System.Windows.Controls.ListBox>().Single();
+                var scroller = (System.Windows.Controls.ScrollViewer)VisualTreeHelper.GetChild(list, 0);
+                model.Selection = model.Clips[30].Id;
+                Snapshots.Pump(0.2);
+                var before = scroller.VerticalOffset;
+                Check(before > 500, $"scrolled down to the selection ({before:0})");
+                model.Delete(model.Clips[30]);
+                Snapshots.Pump(0.5);
+                Check(Math.Abs(scroller.VerticalOffset - before) < 50, $"still at {scroller.VerticalOffset:0}, was {before:0}");
+                model.Query = "item";
+                Snapshots.Pump(0.2);
+                Check(scroller.VerticalOffset == 0, $"a new search starts at the top ({scroller.VerticalOffset:0})");
+            }
+            finally { host.Close(); }
+        }),
+
+        ("32-bit clipboard bitmaps from .NET apps become PNGs", () =>
+        {
+            foreach (var masks in new[] { false, true })
+            {
+                Reset();
+                var r = new Recorder(new Db());
+                Check(r.Record(new Snapshot(Array.Empty<string>(), null, null, Dib32(3, 2, masks)), "Paint", DateTime.Now), "recorded");
+                using var db = new Db();
+                var frame = BitmapDecoder.Create(new Uri(db.Clips().Single().File!), BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0];
+                Check(frame.PixelWidth == 3 && frame.PixelHeight == 2, $"size {frame.PixelWidth}x{frame.PixelHeight} (color masks: {masks})");
+            }
         }),
 
         ("MCP over stdio from the real exe: tools, history, image, mascots", Mcp),
@@ -482,6 +801,52 @@ static class Program
     public const string Svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\"><rect x=\"2\" y=\"5\" width=\"12\" height=\"7\" fill=\"#E8762B\"/><rect x=\"5\" y=\"7\" width=\"2\" height=\"2\" fill=\"#222\"/></svg>";
 
     static Snapshot Text(string s) => new(Array.Empty<string>(), s, null, null);
+
+    static IEnumerable<DependencyObject> Visuals(DependencyObject root) =>
+        Enumerable.Range(0, VisualTreeHelper.GetChildrenCount(root)).Select(i => VisualTreeHelper.GetChild(root, i)).SelectMany(c => new[] { c }.Concat(Visuals(c)));
+
+    /// What .NET's Clipboard.SetImage puts on: 32 bits per pixel, optionally with BI_BITFIELDS color masks after the header.
+    static byte[] Dib32(int w, int h, bool masks)
+    {
+        var header = 40 + (masks ? 12 : 0);
+        var dib = new byte[header + w * h * 4];
+        BitConverter.GetBytes(40).CopyTo(dib, 0);
+        BitConverter.GetBytes(w).CopyTo(dib, 4);
+        BitConverter.GetBytes(h).CopyTo(dib, 8);
+        BitConverter.GetBytes((short)1).CopyTo(dib, 12);
+        BitConverter.GetBytes((short)32).CopyTo(dib, 14);
+        if (masks)
+        {
+            BitConverter.GetBytes(3).CopyTo(dib, 16);
+            BitConverter.GetBytes(0x00FF0000).CopyTo(dib, 40);
+            BitConverter.GetBytes(0x0000FF00).CopyTo(dib, 44);
+            BitConverter.GetBytes(0x000000FF).CopyTo(dib, 48);
+        }
+        for (var i = header; i < dib.Length; i++) dib[i] = 0x80;
+        return dib;
+    }
+
+    /// WIC fails on this with a COMException, which .NET doesn't map to a file-format error.
+    static byte[] BrokenWebp()
+    {
+        var bytes = new byte[116];
+        Encoding.ASCII.GetBytes("RIFF").CopyTo(bytes, 0);
+        BitConverter.GetBytes(100).CopyTo(bytes, 4);
+        Encoding.ASCII.GetBytes("WEBPVP8 ").CopyTo(bytes, 8);
+        var noise = new byte[100];
+        new Random(1).NextBytes(noise);
+        noise.CopyTo(bytes, 16);
+        return bytes;
+    }
+
+    /// Settings needs an App for its shortcut label; WPF allows one per process. Closing a test window mustn't end it.
+    static readonly Lazy<App> TestApp = new(() => new App { ShutdownMode = ShutdownMode.OnExplicitShutdown });
+
+    static IEnumerable<DependencyObject> Descendants(DependencyObject root) =>
+        LogicalTreeHelper.GetChildren(root).OfType<DependencyObject>().SelectMany(c => new[] { c }.Concat(Descendants(c)));
+
+    static void Click(UIElement e) =>
+        e.RaiseEvent(new System.Windows.Input.MouseButtonEventArgs(System.Windows.Input.Mouse.PrimaryDevice, 0, System.Windows.Input.MouseButton.Left) { RoutedEvent = UIElement.MouseLeftButtonUpEvent });
 
     /// Same pixels, different PNG bytes, like a screenshot tool's copy versus its saved file.
     static byte[] Reencode(byte[] png)

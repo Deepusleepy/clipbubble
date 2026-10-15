@@ -177,8 +177,7 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
                 Prefs.Reload();
                 if (S("text") is { } t) { Board.WriteText(t); return Text("Copied text to the clipboard."); }
                 if (Int(a.GetValueOrDefault("id")) is not { } id || db.Clip(id) is not { } c) return Text("Pass text or a valid id.", error: true);
-                Board.Write(c);
-                return Text($"Copied item #{id} to the clipboard.");
+                return Board.Write(c) is { } why ? Text($"Couldn't copy item #{id}. {why}", error: true) : Text($"Copied item #{id} to the clipboard.");
             }
             case "mascot_list":
             {
@@ -223,12 +222,9 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
     {
         try
         {
-            var frame = BitmapDecoder.Create(new Uri(path), BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad).Frames[0];
-            var scale = Math.Min(1.0, 1568.0 / Math.Max(frame.PixelWidth, frame.PixelHeight));
-            BitmapSource img = scale < 1 ? new TransformedBitmap(frame, new ScaleTransform(scale, scale)) : frame;
-            return Convert.ToBase64String(Store.Png(img));
+            return Convert.ToBase64String(Store.Png(Store.DecodeFit(path, 1568).Image));
         }
-        catch (Exception e) when (e is IOException or NotSupportedException or UnauthorizedAccessException or ArgumentException or FileFormatException)
+        catch (Exception e) when (Store.Unreadable(e))
         {
             return null;
         }

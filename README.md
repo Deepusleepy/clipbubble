@@ -69,7 +69,7 @@ powershell -ExecutionPolicy Bypass -File Windows\build.ps1
 Windows blocks unsigned scripts by default, which is why the command allows this one. `build.ps1` builds the app, installs it to `%LOCALAPPDATA%\Programs\ClipBubble` and launches it. To run the tests, run `dotnet build Windows\Tests\ClipBubble.Tests.csproj -c Release`, then `Windows\Tests\bin\Release\net48\ClipBubble.Tests.exe`.
 
 What's different on Windows:
-- <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>Space</kbd> opens the panel. You can change it in Settings. In the panel, <kbd>Ctrl</kbd> replaces <kbd>⌘</kbd> and <kbd>Alt</kbd> replaces <kbd>⌥</kbd>, and <kbd>Ctrl</kbd><kbd>⌫</kbd> deletes.
+- <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>Space</kbd> opens the panel. You can change it in Settings. In the panel, <kbd>Ctrl</kbd> replaces <kbd>⌘</kbd> and <kbd>Alt</kbd> replaces <kbd>⌥</kbd>, and <kbd>Ctrl</kbd><kbd>Delete</kbd> deletes, because <kbd>Ctrl</kbd><kbd>⌫</kbd> deletes a word in the search box.
 - Screenshots come from `Pictures\Screenshots`, where <kbd>Win</kbd><kbd>PrtScn</kbd> and Snipping Tool save them, or from a folder you pick.
 - There's no iPhone filter, because Windows has no Universal Clipboard.
 - Auto-paste needs no permission. Apps running as administrator only get a copy, because Windows blocks typing into them.

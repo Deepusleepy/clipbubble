@@ -50,10 +50,14 @@ sealed class Model
     int unseen;
     public Mascot Mascot { get; private set; } = Mascots.Active();
     public List<Mascot> AllMascots { get; private set; } = Mascots.All();
+    /// Reads happen here on the UI thread; every write goes through `Writer`.
     public readonly Db Db = new();
+    public readonly Writer Writer = new();
 
     public Action<Clip, bool> Pick = (_, _) => { };
     public Action PrefsChanged = () => { };
+    /// Tells the user something they asked for didn't work (title, then the reason).
+    public Action<string, string> ShowError = (_, _) => { };
     /// Raised when the panel opens, after Reset has reloaded it: refocuses search and scrolls to the top.
     public void Shown() => Raise(Change.Shown);
 
@@ -91,8 +95,7 @@ sealed class Model
     public void SetPref(string key, bool on)
     {
         Prefs.SetOn(key, on);
-        Reload();
-        ReloadRecent();
+        Refresh();
         PrefsChanged();
         Raise(Change.Prefs);
     }
@@ -118,13 +121,21 @@ sealed class Model
         Filter = Filters[(i + delta + Filters.Length) % Filters.Length].Tag;
     }
 
+    /// Gone from the list at once; the reload after the write shows what's really stored (the clip again, if the delete failed).
     public void Delete(Clip c)
     {
         var i = Math.Max(0, Clips.FindIndex(x => x.Id == c.Id));
-        Db.Delete(c.Id);
         Clips.RemoveAll(x => x.Id == c.Id);
         if (Selection == c.Id) selection = Clips.Count == 0 ? null : Clips[Math.Min(i, Clips.Count - 1)].Id;
         Raise(Change.Clips);
+        Writer.Write(db => { db.Delete(c.Id); Forgotten.Remove(c); }, Refresh);
+    }
+
+    public void ClearAll() => Writer.Write(db => { db.DeleteAll(); Forgotten.ClearAll(); }, Refresh);
+
+    public void Refresh()
+    {
+        Reload();
         ReloadRecent();
     }
 }
@@ -153,28 +164,15 @@ static class Thumbs
         {
             BitmapSource? img = null;
             Size? dims = null;
-            try
+            try { (img, dims) = Store.DecodeFit(path, px); }
+            catch (Exception e)
             {
-                // Read through a shared stream that's closed right after, so the user's file is never left locked.
-                using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                var frame = BitmapDecoder.Create(file, BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.None).Frames[0];
-                dims = new Size(frame.PixelWidth, frame.PixelHeight);
-                file.Position = 0;
-                var bi = new BitmapImage();
-                bi.BeginInit();
-                bi.StreamSource = file;
-                bi.CacheOption = BitmapCacheOption.OnLoad;
-                bi.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
-                if (frame.PixelWidth >= frame.PixelHeight) bi.DecodePixelWidth = Math.Min(px, frame.PixelWidth);
-                else bi.DecodePixelHeight = Math.Min(px, frame.PixelHeight);
-                bi.EndInit();
-                bi.Freeze();
-                img = bi;
+                // Whatever failed, the callbacks below still run; otherwise this picture would stay blank until a restart.
+                if (!Store.Unreadable(e)) Log.Error(e);
             }
-            catch (Exception e) when (e is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException or InvalidOperationException) { }
             dispatcher.BeginInvoke(new Action(() =>
             {
-                if (px <= 64) Cache[key] = img;   // row thumbnails only; full-size previews would pile up
+                if (px <= 64 && img != null) Cache[key] = img;   // row thumbnails only, so previews don't pile up; a failure is retried, as the file may have been saving
                 if (dims is { } d) Dims[path] = d;
                 var callbacks = Pending[key];
                 Pending.Remove(key);
@@ -277,10 +275,11 @@ static class UI
     }
 
     /// `C:\Users\me\Documents` as `~\Documents`, like the Mac's abbreviatingWithTildeInPath.
-    public static string Tilde(string path)
+    public static string Tilde(string path, string? home = null)
     {
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        return path.StartsWith(home, StringComparison.OrdinalIgnoreCase) ? "~" + path.Substring(home.Length) : path;
+        home ??= Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var inside = path.Length == home.Length || (path.Length > home.Length && path[home.Length] is '\\' or '/');   // C:\Users\Ann, not C:\Users\Anna
+        return inside && path.StartsWith(home, StringComparison.OrdinalIgnoreCase) ? "~" + path.Substring(home.Length) : path;
     }
 
     /// A shallow curve: `up` is a "^" (happy eye); otherwise a smile, optionally closed into an open mouth.
@@ -523,12 +522,28 @@ static class Win
     public static bool ModifiersDown() =>
         new[] { 0x10, 0x11, 0x12, 0x5B, 0x5C }.Any(vk => (GetAsyncKeyState(vk) & 0x8000) != 0);
 
-    public static void SendPaste()
+    /// Presses Ctrl+V. False when Windows refused the keystrokes (another app's input block, the lock screen).
+    public static bool SendPaste()
     {
         INPUT Key(ushort vk, bool up) => new() { type = 1, u = new InputUnion { ki = new KEYBDINPUT { vk = vk, flags = up ? 2u : 0u } } };
         var inputs = new[] { Key(0x11, false), Key(0x56, false), Key(0x56, true), Key(0x11, true) };
-        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
     }
+
+    /// Waits up to `timeout` seconds for `ready` (the app is back in front and the keys used to pick are released),
+    /// then sends the paste, unless something else replaced the clipboard meanwhile. Returns whether it was sent.
+    public static async Task<bool> PasteWhenReady(Func<bool> ready, Func<bool> stillOurs, Func<bool> send, double timeout = 1.5)
+    {
+        var started = DateTime.UtcNow;
+        while (!ready())
+        {
+            if ((DateTime.UtcNow - started).TotalSeconds >= timeout) return false;
+            await Task.Delay(10);
+        }
+        return stillOurs() && send();
+    }
+
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
 
     /// Windows silently drops keystrokes sent to an app at a higher integrity level (one running as administrator),
     /// so those just get the copy.
@@ -797,15 +812,13 @@ sealed class Row : Border
     TextBlock? hint;
     Point? down;
 
-    public Row(Clip clip, int index, bool selected, Model model)
+    public Row(Clip clip, int index, bool isSelected, Model model)
     {
         this.clip = clip;
         this.model = model;
-        this.selected = selected;
         Height = 46;
         Padding = new Thickness(8, 0, 8, 0);
         CornerRadius = new CornerRadius(9);
-        Background = selected ? UI.White(0.12) : Brushes.Transparent;
         Cursor = Cursors.Arrow;
 
         var grid = new Grid();
@@ -827,13 +840,14 @@ sealed class Row : Border
 
         if (index is >= 0 and < 9)
         {
-            hint = UI.Label($"Ctrl+{index + 1}", 11, selected ? UI.Secondary : UI.Tertiary, FontWeights.Medium);
+            hint = UI.Label($"Ctrl+{index + 1}", 11, UI.Tertiary, FontWeights.Medium);
             hint.Margin = new Thickness(6, 0, 0, 0);
             hint.VerticalAlignment = VerticalAlignment.Center;
             Grid.SetColumn(hint, 2);
             grid.Children.Add(hint);
         }
         Child = grid;
+        Selected = isSelected;
 
         // An image's size is known once its thumbnail has decoded.
         if (clip.Kind == ClipKind.Image && clip.ImagePath is { } p && Thumbs.SizeOf(p) == null)
@@ -1056,8 +1070,9 @@ sealed class PanelView : Grid
             {
                 case Change.Clips: RenderRows(); break;
                 case Change.Selection: Select(); break;
-                case Change.Filter: RenderFilters(); break;
+                case Change.Filter: backToTop = true; RenderFilters(); break;
                 case Change.Query:
+                    backToTop = true;
                     if (search.Text != model.Query) search.Text = model.Query;
                     clear.Visibility = model.Query.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
                     break;
@@ -1123,11 +1138,16 @@ sealed class PanelView : Grid
         }
     }
 
+    /// A new search or filter shows its results from the top; a delete or a new clip keeps the list where it was.
+    bool backToTop;
+
     void RenderRows()
     {
         listArea.Children.Clear();
         listArea.Children.Add(list);
         list.ItemsSource = model.Clips.Select((c, i) => new RowItem(c, i, i == model.Clips.Count - 1, model)).ToList();
+        if (backToTop && list.Items.Count > 0) list.ScrollIntoView(list.Items[0]);
+        backToTop = false;
         if (model.Clips.Count == 0)
         {
             var empty = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
@@ -1164,7 +1184,7 @@ sealed class PanelView : Grid
         gear.MouseLeftButtonUp += (_, _) => model.ShowSettings = true;
         footer.Children.Add(gear);
         var keys = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
-        foreach (var (k, label) in new[] { ("↩", "Paste"), ("Alt ↩", "Copy"), ("Ctrl Y", "Preview"), ("Ctrl ⌫", "Delete") })
+        foreach (var (k, label) in new[] { ("↩", "Paste"), ("Alt ↩", "Copy"), ("Ctrl Y", "Preview"), ("Ctrl Del", "Delete") })
             keys.Children.Add(Key(k, label, keys.Children.Count == 0 ? 0 : 14));
         footer.Children.Add(keys);
         return footer;
@@ -1325,7 +1345,7 @@ sealed class SettingsView : Grid
 
         var save = Section("Save to history");
         foreach (var c in Prefs.Categories.Where(c => c.Key is not ("screenshots" or "downloads")))
-            save.Children.Add(Row(c.Icon, c.Title, c.Detail, Switch(Prefs.On(c.Key), on => model.SetPref(c.Key, on))));
+            save.Children.Add(Row(c.Icon, c.Title, c.Detail, Switch(Prefs.On(c.Key), on => Save(() => model.SetPref(c.Key, on)))));
         save.Children.Add(Note("Turning one off stops saving it and hides what's already there, for your agents too."));
 
         var folders = Section("Folders & permissions");
@@ -1334,16 +1354,16 @@ sealed class SettingsView : Grid
         var shotExtra = new StackPanel();
         var links = new StackPanel { Orientation = Orientation.Horizontal };
         links.Children.Add(Link("Change folder…", PickShotsFolder));
-        if (custom) links.Children.Add(Link("Use Pictures\\Screenshots", () => { Prefs.Set("screenshotFolder", null); model.SetPref("screenshots", true); }, 12));
+        if (custom) links.Children.Add(Link("Use Pictures\\Screenshots", () => Save(() => { Prefs.Set("screenshotFolder", null); model.SetPref("screenshots", true); }), 12));
         shotExtra.Children.Add(links);
-        shotExtra.Children.Add(Check("Also copy new ones to the clipboard", Prefs.Get("copyScreenshots", true), on => Prefs.Set("copyScreenshots", on)));
+        shotExtra.Children.Add(Check("Also copy new ones to the clipboard", Prefs.Get("copyScreenshots", true), on => Save(() => Prefs.Set("copyScreenshots", on))));
         folders.Children.Add(PermRow(UI.Camera, "Screenshots", shots, custom ? "Folder you picked" : "Where Windows and Snipping Tool save them",
             Prefs.On("screenshots") ? shown.ShotsOk : null, "screenshots", shotExtra));
         var downloads = shown.Downloads;
         folders.Children.Add(PermRow(UI.Download, "Recent downloads", downloads, null,
             Prefs.On("downloads") ? shown.DownloadsOk : null, "downloads", null));
         folders.Children.Add(Row(UI.Keyboard, "Auto-paste", "Enter pastes into the app you were in. Apps running as administrator just get a copy.",
-            Switch(Prefs.Get("autoPaste", true), on => Prefs.Set("autoPaste", on))));
+            Switch(Prefs.Get("autoPaste", true), on => Save(() => Prefs.Set("autoPaste", on)))));
         folders.Children.Add(Row(UI.Keyboard, "Open ClipBubble", null, HotkeyBox()));
 
         var mascots = Section("Mascot");
@@ -1354,7 +1374,7 @@ sealed class SettingsView : Grid
             var cell = new Grid { Width = 42, Height = 42, Margin = new Thickness(0, 0, 8, 8), Background = Brushes.Transparent, ToolTip = m.Name };
             cell.Children.Add(new Ellipse { Fill = new SolidColorBrush(Color.FromRgb(23, 23, 23)), Stroke = active ? UI.AccentBrush : UI.White(0.1), StrokeThickness = active ? 2 : 1 });
             cell.Children.Add(new MascotView(m) { LayoutTransform = new ScaleTransform(0.8, 0.8) });
-            cell.MouseLeftButtonUp += (_, _) => { Mascots.SetActive(m.Id); model.LoadMascots(); };
+            cell.MouseLeftButtonUp += (_, _) => { if (Save(() => Mascots.SetActive(m.Id))) model.LoadMascots(); };
             grid.Children.Add(cell);
         }
         var plus = new Grid { Width = 42, Height = 42, Margin = new Thickness(0, 0, 8, 8), Background = Brushes.Transparent, ToolTip = "Add your own (PNG, GIF, SVG)" };
@@ -1386,7 +1406,7 @@ sealed class SettingsView : Grid
         agents.Children.Add(Note("Paste it into your agent and it connects itself.", top: 4));
 
         var general = Section("General");
-        general.Children.Add(Row(UI.Power, "Open at login", null, Switch(App.OpenAtLogin, on => App.OpenAtLogin = on)));
+        general.Children.Add(Row(UI.Power, "Open at login", null, Switch(App.OpenAtLogin, on => Save(() => App.OpenAtLogin = on))));
         var buttons = new Grid { Margin = new Thickness(0, 6, 0, 0) };
         buttons.Children.Add(Button("Clear all history…", null, ClearAll));
         var quit = Button("Quit ClipBubble", null, () => Application.Current.Shutdown());
@@ -1479,29 +1499,42 @@ sealed class SettingsView : Grid
         if (extra != null) { extra.Margin = new Thickness(0, 3, 0, 0); texts.Children.Add(extra); }
         Grid.SetColumn(texts, 1);
         g.Children.Add(texts);
-        var sw = Switch(Prefs.On(pref), on => model.SetPref(pref, on));
+        var sw = Switch(Prefs.On(pref), on => Save(() => model.SetPref(pref, on)));
         sw.VerticalAlignment = VerticalAlignment.Top;
         Grid.SetColumn(sw, 2);
         g.Children.Add(sw);
         return g;
     }
 
-    /// The Mac's mini switch: a 26 x 15 capsule with a white knob.
-    static FrameworkElement Switch(bool on, Action<bool> changed)
+    /// Saves a setting. If that fails (the data folder is read-only or locked), it says so and returns false, so the
+    /// control that changed it stays as it was.
+    bool Save(Action save)
+    {
+        try { save(); return true; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            Log.Error(e);
+            model.ShowError("Couldn't save that setting", e.Message);
+            return false;
+        }
+    }
+
+    /// The Mac's mini switch: a 26 x 15 capsule with a white knob. `changed` returns false when the change didn't take.
+    static FrameworkElement Switch(bool on, Func<bool, bool> changed)
     {
         var knob = new Ellipse { Width = 13, Height = 13, Fill = Brushes.White, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(on ? 12 : 1, 0, 0, 0) };
         var track = new Border { Width = 26, Height = 15, CornerRadius = new CornerRadius(7.5), Background = on ? UI.AccentBrush : UI.White(0.18), Child = knob, Cursor = Cursors.Arrow };
         track.MouseLeftButtonUp += (_, _) =>
         {
+            if (!changed(!on)) return;
             on = !on;
             track.Background = on ? UI.AccentBrush : UI.White(0.18);
             knob.BeginAnimation(MarginProperty, new ThicknessAnimation(new Thickness(on ? 12 : 1, 0, 0, 0), TimeSpan.FromSeconds(0.15)));
-            changed(on);
         };
         return track;
     }
 
-    static FrameworkElement Check(string title, bool on, Action<bool> changed)
+    static FrameworkElement Check(string title, bool on, Func<bool, bool> changed)
     {
         var box = new Border { Width = 13, Height = 13, CornerRadius = new CornerRadius(3), Margin = new Thickness(0, 0, 6, 0), BorderThickness = new Thickness(1) };
         var mark = new TextBlock { Text = UI.Check, FontFamily = UI.Icons, FontSize = 9, Foreground = Brushes.White, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
@@ -1511,7 +1544,7 @@ sealed class SettingsView : Grid
         var row = new StackPanel { Orientation = Orientation.Horizontal, Background = Brushes.Transparent, Margin = new Thickness(0, 4, 0, 0) };
         row.Children.Add(box);
         row.Children.Add(UI.Label(title, 11, UI.Secondary));
-        row.MouseLeftButtonUp += (_, _) => { on = !on; Paint(); changed(on); };
+        row.MouseLeftButtonUp += (_, _) => { if (!changed(!on)) return; on = !on; Paint(); };
         return row;
     }
 
@@ -1572,7 +1605,8 @@ sealed class SettingsView : Grid
             if (key is Key.LeftCtrl or Key.RightCtrl or Key.LeftShift or Key.RightShift or Key.LeftAlt or Key.RightAlt or Key.LWin or Key.RWin) return;
             var mods = Keyboard.Modifiers;
             if (mods == ModifierKeys.None || mods == ModifierKeys.Shift) return;   // a bare key would swallow typing everywhere
-            var taken = !app.SetHotkey(mods, key);
+            var taken = false;
+            Save(() => taken = !app.SetHotkey(mods, key));
             Stop(taken ? "Taken, try another" : app.HotkeyLabel);
         };
         return box;
@@ -1581,8 +1615,7 @@ sealed class SettingsView : Grid
     void PickShotsFolder()
     {
         if (app.Modal(() => Shell.PickFolder(Win.Handle(app.PanelWindow), FolderWatcher.ScreenshotFolder, "Pick the folder ClipBubble should watch for screenshots")) is not { } folder) return;
-        Prefs.Set("screenshotFolder", folder);
-        model.SetPref("screenshots", true);
+        Save(() => { Prefs.Set("screenshotFolder", folder); model.SetPref("screenshots", true); });
     }
 
     /// Picks an image or GIF and makes it the mascot.
@@ -1598,16 +1631,14 @@ sealed class SettingsView : Grid
         }
         catch (Exception e) when (e is MascotException or IOException or UnauthorizedAccessException)
         {
-            app.Modal(() => Alert.Show(app.PanelWindow, "Couldn't add that mascot", e.Message, "OK", cancel: null));
+            model.ShowError("Couldn't add that mascot", e.Message);
         }
     }
 
     void ClearAll()
     {
         if (!app.Modal(() => Alert.Show(app.PanelWindow, "Clear all clipboard history?", "This removes every saved item and image. It can't be undone.", "Clear"))) return;
-        model.Db.DeleteAll();
-        model.Reload();
-        model.ReloadRecent();
+        model.ClearAll();
     }
 }
 
@@ -1635,9 +1666,8 @@ sealed class App : Application
         DispatcherUnhandledException += (_, x) => { Log.Error(x.Exception); x.Handled = true; };
         AppDomain.CurrentDomain.UnhandledException += (_, x) => { if (x.ExceptionObject is Exception ex) Log.Error(ex); };
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
-        model.Db.Prune();
-        model.Reload();
-        model.ReloadRecent();
+        model.Writer.Write(db => db.Prune());   // storage only: lists already leave out anything older than 7 days
+        model.Refresh();
 
         face = new BubbleView(model);
         bubble = new FloatingWindow(64, 64, keyable: false) { Content = face, Opacity = IdleAlpha };
@@ -1661,13 +1691,14 @@ sealed class App : Application
 
         model.Pick = Pick;
         model.PrefsChanged = () => { SyncScreenshots(); SyncDownloads(); ImportFolders(); };
+        model.ShowError = (title, reason) => Modal(() => Alert.Show(panel, title, reason, "OK", cancel: null));
 
-        capture = new Capture(Captured);
+        capture = new Capture(model.Writer, Captured);
         SyncScreenshots();
         SyncDownloads();
         ImportFolders();
         After(8, ImportFolders);
-        Every(3600, () => { model.Db.Prune(); ImportFolders(); });
+        Every(3600, () => { model.Writer.Write(db => db.Prune()); ImportFolders(); });
 
         messages = new HwndSource(new HwndSourceParameters("ClipBubble messages") { ParentWindow = new IntPtr(-3) });
         messages.AddHook(Messages);
@@ -1764,7 +1795,8 @@ sealed class App : Application
             RegisterHotkey();
             return false;
         }
-        Prefs.Set("hotkey", HotkeyText);
+        try { Prefs.Set("hotkey", HotkeyText); }
+        catch { hotkey = old; RegisterHotkey(); throw; }   // a shortcut that's gone after a restart isn't really set
         model.ReloadRecent();
         return true;
     }
@@ -1801,7 +1833,10 @@ sealed class App : Application
         screenshots = new FolderWatcher(folder, 120, p => Store.IsImagePath(p) || new[] { ".mov", ".mp4" }.Contains(Path.GetExtension(p).ToLowerInvariant()), (path, date) =>
             capture.AddFiles("Screenshot", () => new[] { (path, date) }, () =>
             {
-                if (Prefs.Get("copyScreenshots", true)) Board.WriteFiles(new[] { path }); else Captured();
+                // A copy to the clipboard is announced when the clipboard watcher saves it, unless copied files aren't saved.
+                var copy = Prefs.Get("copyScreenshots", true);
+                if (!copy || !Prefs.On("files")) Captured();
+                if (copy) Board.WriteFiles(new[] { path });
             }));
     }
 
@@ -1817,36 +1852,32 @@ sealed class App : Application
         else { downloads?.Dispose(); downloads = null; }
     }
 
-    /// Backfills the last 7 days of screenshots and downloads. Cheap and idempotent, so it also reruns later.
+    /// Backfills the last 7 days of screenshots and downloads, except ones the user removed. Cheap and idempotent,
+    /// so it also reruns later.
     void ImportFolders()
     {
         foreach (var (watcher, source) in new[] { (screenshots, "Screenshot"), (downloads, "Downloads") })
             if (watcher != null)
-                capture.AddFiles(source, () => watcher.Existing(7), () => { model.Reload(); model.ReloadRecent(); });
+                capture.AddFiles(source, () => { var gone = Forgotten.Load(); return watcher.Existing(7).Where(f => !gone.Has(f.Path, f.Added)); }, model.Refresh);
     }
 
     // MARK: Picking
 
-    /// Puts the clip on the clipboard and, unless copying only, pastes it into the app underneath.
-    void Pick(Clip c, bool paste)
+    /// Puts the clip on the clipboard and, unless copying only, pastes it into the app underneath. If it can't go on
+    /// the clipboard, it says why instead of pasting whatever was there before.
+    async void Pick(Clip c, bool paste)
     {
         var target = panel.IsVisible ? pasteTarget : Win.GetForegroundWindow();
-        Board.Write(c);
+        if (Board.Write(c) is { } why) { model.ShowError("Couldn't copy that", why); return; }
+        var copied = Win.GetClipboardSequenceNumber();
         HidePanel();
         HidePeek();
         if (!paste || !Prefs.Get("autoPaste", true) || target == IntPtr.Zero || !Win.IsWindow(target) || !Win.CanPasteInto(target)) return;
         Win.SetForegroundWindow(target);
-        // Wait until the app is back in front and the keys used to pick (Enter, Ctrl, Alt) are released.
-        var started = DateTime.Now;
-        var wait = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(10) };
-        wait.Tick += (_, _) =>
-        {
-            var ready = Win.GetForegroundWindow() == target && !Win.ModifiersDown();
-            if (!ready && (DateTime.Now - started).TotalSeconds < 1.5) return;
-            wait.Stop();
-            if (ready) Win.SendPaste();
-        };
-        wait.Start();
+        await Win.PasteWhenReady(
+            () => Win.GetForegroundWindow() == target && !Win.ModifiersDown(),
+            () => Win.GetClipboardSequenceNumber() == copied,
+            Win.SendPaste);
     }
 
     void HandleKey(object sender, KeyEventArgs e)
@@ -1871,7 +1902,7 @@ sealed class App : Application
                 else if (model.Query.Length > 0) model.Query = "";
                 else HidePanel();
                 break;
-            case Key.Back when ctrl: if (model.Selected is { } d) model.Delete(d); break;
+            case Key.Delete when ctrl: if (model.Selected is { } d) model.Delete(d); break;   // not Ctrl+Backspace: that deletes a word in the search box
             case Key.Y when ctrl: model.Previewing = !model.Previewing; break;
             case >= Key.D1 and <= Key.D9 when ctrl:
                 var n = key - Key.D1;
@@ -1894,7 +1925,8 @@ sealed class App : Application
         if (animated)
         {
             corner = (center.Y < (area.Top + area.Bottom) / 2 ? "t" : "b") + (center.X > (area.Left + area.Right) / 2 ? "r" : "l");
-            Prefs.Set("corner", corner);
+            try { Prefs.Set("corner", corner); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log.Error(e); }   // still snaps, just isn't remembered
         }
         var scale = Win.Scale(bubble);
         int w = f.Right - f.Left, h = f.Bottom - f.Top, m = (int)Math.Round(Margin * scale);

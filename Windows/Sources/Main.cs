@@ -27,6 +27,8 @@ namespace ClipBubble
                 if (EventWaitHandle.TryOpenExisting(OpenEvent, out var open)) open.Set();
                 return 0;
             }
+            // Made before the app starts, so a second launch during startup still opens the panel once it's up.
+            using var openSignal = new EventWaitHandle(false, EventResetMode.AutoReset, OpenEvent);
             new App().Run();
             return 0;
         }
