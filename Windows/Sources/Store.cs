@@ -466,9 +466,9 @@ static class Board
         {
             ClipKind.Text => TextData(c.Text),
             ClipKind.Image => c.File is { } f && PngData(f) is { } png ? ImageData(png) : null,
-            _ => FilesData(c.Paths),
+            _ => c.Paths.Any(p => System.IO.File.Exists(p) || Directory.Exists(p)) ? FilesData(c.Paths) : null,
         };
-        if (data == null) return "Its image file is gone or can't be read.";
+        if (data == null) return c.Kind == ClipKind.Image ? "Its image file is gone or can't be read." : "Its files are gone.";
         try { Set(data); return null; }
         catch (ExternalException) { return "Another app is using the clipboard. Try again in a moment."; }   // past WPF's own retries
     }

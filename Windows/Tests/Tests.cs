@@ -453,6 +453,7 @@ static class Program
             var broken = Path.Combine(Paths.Dir, "broken.webp");
             File.WriteAllBytes(broken, BrokenWebp());
             Check(Board.Write(gone with { File = broken }) != null, "broken WebP: same");
+            Check(Board.Write(new Clip(2, ClipKind.File, Path.Combine(Paths.Dir, "gone.pdf"), null, "Downloads", DateTime.Now)) == "Its files are gone.", "a file clip whose file is gone: same");
             File.Delete(broken);   // throws if the failed read left the user's file locked
             using var db = new Db();
             Sql.Exec(Paths.Db, $"INSERT INTO clips(kind,text,file,source,hash,created) VALUES('image','','{gone.File}','Paint','i:gone',{DateTimeOffset.UtcNow.ToUnixTimeSeconds()})");
@@ -785,6 +786,20 @@ static class Program
             r.Record(Text("first"), "Notepad", t0.AddSeconds(6));
             var texts = db.Clips().Select(c => c.Text).OrderBy(t => t).ToList();
             Check(texts.SequenceEqual(new[] { "first", "second" }), "both kept: " + string.Join(",", texts));
+        }),
+
+        ("a folder that shows up after the start reports only files saved since", () =>
+        {
+            var folder = Path.Combine(Paths.Dir, "drive-" + Guid.NewGuid().ToString("N").Substring(0, 6));
+            var seen = new List<string>();
+            using var watcher = new FolderWatcher(folder, null, _ => true, (path, _) => seen.Add(Path.GetFileName(path)));
+            Directory.CreateDirectory(folder);   // like a drive being plugged back in, with old files on it
+            var old = Path.Combine(folder, "old.pdf");
+            File.WriteAllText(old, "x");
+            File.SetCreationTime(old, DateTime.Now.AddDays(-2));
+            File.WriteAllText(Path.Combine(folder, "new.pdf"), "x");
+            Snapshots.Pump(6);   // the watcher re-checks for a missing folder every 5 s
+            Check(seen.SequenceEqual(new[] { "new.pdf" }), "reported: " + string.Join(",", seen));
         }),
 
         ("MCP over stdio from the real exe: tools, history, image, mascots", Mcp),

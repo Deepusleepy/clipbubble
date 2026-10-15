@@ -342,9 +342,11 @@ sealed class FolderWatcher : IDisposable
     readonly Action<string, DateTime> onNew;
     readonly DispatcherTimer debounce = new() { Interval = TimeSpan.FromSeconds(0.4) };
     readonly DispatcherTimer retry = new() { Interval = TimeSpan.FromSeconds(5) };
-    /// Null while a folder that exists can't be listed yet, so a listing that fails never makes everything look new.
-    /// A folder that doesn't exist yet starts empty: everything saved into it later is new.
+    /// Null until the folder could be listed once. Until then only files created after the watcher started count as new,
+    /// so a folder that appears later (Snipping Tool's first save) reports its new screenshot, while one that was
+    /// missing or unreadable for a while (an unplugged drive) doesn't report everything already in it.
     HashSet<string>? known;
+    readonly DateTime started = DateTime.Now;
     FileSystemWatcher? watcher;
     bool stopped;
 
@@ -357,8 +359,7 @@ sealed class FolderWatcher : IDisposable
         this.onNew = onNew;
         debounce.Tick += (_, _) => { debounce.Stop(); Scan(); };
         retry.Tick += (_, _) => Start();
-        if (!Directory.Exists(folder)) known = new();
-        else if (Listing() is { } now) known = new(now);
+        if (Listing() is { } now) known = new(now);
         Start();
     }
 
@@ -417,7 +418,7 @@ sealed class FolderWatcher : IDisposable
     void Scan()
     {
         if (stopped || Listing() is not { } now) return;
-        var fresh = known == null ? new List<string>() : now.Where(p => !known.Contains(p)).ToList();
+        var fresh = now.Where(p => known == null ? Added(p) >= started : !known.Contains(p)).ToList();
         known = new HashSet<string>(now);
         DateTime? cutoff = maxAge.HasValue ? DateTime.Now.AddSeconds(-maxAge.Value) : null;
         foreach (var path in fresh.OrderBy(Added))
