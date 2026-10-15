@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A tiny bubble that remembers everything you copy.</b><br>
-  Clipboard history for macOS with a mascot, a magnet, and an MCP server for your AI agents.
+  Clipboard history for macOS and Windows with a mascot, a magnet, and an MCP server for your AI agents.
 </p>
 
 <p align="center">
@@ -52,6 +52,35 @@ git clone https://github.com/rohit3a/clipbubble && cd clipbubble && ./build.sh
 - **Screenshots:** ClipBubble watches the folder from your macOS screenshot setting (⌘⇧5 → Options → Save to), and notices when you change it. You can also pick a different folder.
 - **Recent downloads:** your Downloads folder.
 - **Auto-paste:** needs Accessibility access. Without it (or with it switched off), picking an item just copies it.
+
+## Windows
+
+The Windows version lives in [`Windows/`](Windows). It's a separate C# app with the same panel, mascots, history database and MCP tools. It needs Windows 10 22H2 or Windows 11 and nothing else. It runs on the .NET Framework that ships with Windows, as one 220 KB `ClipBubble.exe`.
+
+**Download:** grab `ClipBubble-Windows.zip` from [Releases](https://github.com/rohit3a/clipbubble/releases/latest), unzip it anywhere and run `ClipBubble.exe`. It isn't signed, so the first launch shows SmartScreen: click **More info** → **Run anyway**.
+
+**Or build from source** (needs the [.NET SDK](https://dotnet.microsoft.com/download)):
+
+```powershell
+git clone https://github.com/rohit3a/clipbubble; cd clipbubble
+powershell -ExecutionPolicy Bypass -File Windows\build.ps1
+```
+
+Windows blocks unsigned scripts by default, which is why the command allows this one. `build.ps1` builds the app, installs it to `%LOCALAPPDATA%\Programs\ClipBubble` and launches it. To run the tests, run `dotnet build Windows\Tests\ClipBubble.Tests.csproj -c Release`, then `Windows\Tests\bin\Release\net48\ClipBubble.Tests.exe`.
+
+What's different on Windows:
+- <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>Space</kbd> opens the panel. You can change it in Settings. In the panel, <kbd>Ctrl</kbd> replaces <kbd>⌘</kbd> and <kbd>Alt</kbd> replaces <kbd>⌥</kbd>, and <kbd>Ctrl</kbd><kbd>Delete</kbd> deletes, because <kbd>Ctrl</kbd><kbd>⌫</kbd> deletes a word in the search box.
+- Screenshots come from `Pictures\Screenshots`, where <kbd>Win</kbd><kbd>PrtScn</kbd> and Snipping Tool save them, or from a folder you pick.
+- There's no iPhone filter, because Windows has no Universal Clipboard.
+- Auto-paste needs no permission. Apps running as administrator only get a copy, because Windows blocks typing into them.
+- Copies marked as secret by password managers (`ExcludeClipboardContentFromMonitorProcessing`) are never stored.
+- History lives in `%LOCALAPPDATA%\ClipBubble`.
+
+For MCP, use the path of your `ClipBubble.exe`, or copy the setup prompt from Settings:
+
+```powershell
+claude mcp add --scope user clipbubble -- "$env:LOCALAPPDATA\Programs\ClipBubble\ClipBubble.exe" --mcp
+```
 
 ## Keys
 
