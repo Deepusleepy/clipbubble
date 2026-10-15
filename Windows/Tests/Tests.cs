@@ -46,6 +46,7 @@ static class Program
     static void Reset()
     {
         using (var db = new Db()) db.DeleteAll();
+        Sql.Exec(Paths.Db, "DELETE FROM forgotten");
         foreach (var c in Prefs.Categories) Prefs.SetOn(c.Key, true);
         File.Delete(Path.Combine(Paths.Dir, "forgotten.json"));
         if (Directory.Exists(Mascots.Dir)) Directory.Delete(Mascots.Dir, true);
@@ -59,11 +60,12 @@ static class Program
         ("schema matches the Mac app", () =>
         {
             using (new Db()) { }
-            var sql = Sql.Query(Paths.Db, "SELECT sql FROM sqlite_master WHERE name IN ('clips','clips_created') ORDER BY name");
+            var sql = Sql.Query(Paths.Db, "SELECT sql FROM sqlite_master WHERE name IN ('clips','clips_created','forgotten') ORDER BY name");
             Check(Squash(sql[0]) == Squash(@"CREATE TABLE clips(
               id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
               file TEXT, source TEXT NOT NULL DEFAULT '', hash TEXT UNIQUE NOT NULL, created REAL NOT NULL)"), "clips table: " + sql[0]);
             Check(Squash(sql[1]) == Squash("CREATE INDEX clips_created ON clips(created)"), "index: " + sql[1]);
+            Check(Squash(sql[2]) == Squash("CREATE TABLE forgotten(hash TEXT PRIMARY KEY, at REAL NOT NULL)"), "forgotten table: " + sql[2]);
             Check(Sql.Query(Paths.Db, "PRAGMA journal_mode")[0] == "wal", "WAL mode");
         }),
 
@@ -378,6 +380,7 @@ static class Program
             Check(db.Clips().Count == 1, "file first: one row");
 
             db.DeleteAll();
+            Sql.Exec(Paths.Db, "DELETE FROM forgotten");   // Clear all would keep the screenshot out from now on
             r = new Recorder(new Db());
             r.Record(new Snapshot(Array.Empty<string>(), null, reencoded, null), "Snipping Tool", DateTime.Now);
             r.AddFile(shot, "Screenshot", DateTime.Now);
@@ -612,31 +615,38 @@ static class Program
             Check(img != null && img.PixelWidth <= 102 && img.PixelHeight <= 51, $"decoded at {img?.PixelWidth}x{img?.PixelHeight} to show at 34 px");
         }),
 
-        ("removed screenshots and downloads stay out of history", () =>
+        ("removed screenshots and downloads stay out of history, like on the Mac", () =>
         {
             var shot = Path.Combine(Paths.Dir, "Screenshot 2.png");
             var download = Path.Combine(Paths.Dir, "report.pdf");
+            var copied = Path.Combine(Paths.Dir, "notes.txt");
             File.WriteAllBytes(shot, TinyPng());
             File.WriteAllText(download, "%PDF");
-            using (var db = new Db())
+            File.WriteAllText(copied, "x");
+            using var db = new Db();
+            void Import()
             {
                 db.InsertIfMissing(ClipKind.File, shot, "Screenshot", "f:" + Store.Sha(shot), DateTime.Now);
                 db.InsertIfMissing(ClipKind.File, download, "Downloads", "f:" + Store.Sha(download), DateTime.Now);
             }
+            Import();
+            db.Upsert(ClipKind.File, copied, null, "File Explorer", "f:" + Store.Sha(copied));
             var model = new Model();
             model.Refresh();
             model.Delete(model.Clips.Single(c => c.Source == "Screenshot"));
+            model.Delete(model.Clips.Single(c => c.Source == "File Explorer"));
             Snapshots.Pump(0.5);
-            var gone = Forgotten.Load()!;
-            Check(gone.Has(shot, DateTime.Now.AddMinutes(-1)) && !gone.Has(download, DateTime.Now.AddMinutes(-1)), "the removed screenshot is skipped, the download isn't");
-            Check(!gone.Has(shot, DateTime.Now.AddMinutes(1)), "a new file saved later at the same path still comes in");
-            Thread.Sleep(5);
-            Check(!gone.Has(shot, DateTime.Now), "even within the same second");
+            Import();
+            var sources = db.Clips().Select(c => c.Source).ToList();
+            Check(sources.SequenceEqual(new[] { "Downloads" }), "the removed screenshot isn't imported again: " + string.Join(",", sources));
+            Check(Sql.Query(Paths.Db, "SELECT count(*) FROM forgotten")[0] == "1", "only screenshots and downloads are remembered, not files copied in Explorer");
             model.ClearAll();
             Snapshots.Pump(0.5);
-            gone = Forgotten.Load()!;
-            Check(gone.Has(download, DateTime.Now.AddMinutes(-1)), "after Clear all, files from before it are skipped");
-            Check(!gone.Has(Path.Combine(Paths.Dir, "new.png"), DateTime.Now.AddMinutes(1)), "files added later still come in");
+            Import();
+            Check(db.Clips().Count == 0, "after Clear all, neither comes back");
+            Sql.Exec(Paths.Db, $"UPDATE forgotten SET at = {DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 9 * 24 * 3600}");
+            db.Prune();
+            Check(Sql.Query(Paths.Db, "SELECT count(*) FROM forgotten")[0] == "0", "reminders older than the window plus a day are dropped");
         }),
 
         ("a folder that briefly can't be read doesn't make old files look new", () =>
@@ -770,23 +780,6 @@ static class Program
             Check(writer.Finish(TimeSpan.FromSeconds(5)) && done, "finished before returning");
         }),
 
-        ("if the removed-files list can't be saved, the screenshot isn't deleted either", () =>
-        {
-            var shot = Path.Combine(Paths.Dir, "Screenshot 4.png");
-            File.WriteAllBytes(shot, TinyPng());
-            using (var db = new Db()) db.InsertIfMissing(ClipKind.File, shot, "Screenshot", "f:" + Store.Sha(shot), DateTime.Now);
-            var list = Path.Combine(Paths.Dir, "forgotten.json");
-            File.WriteAllText(list, "{}");
-            var model = new Model();
-            model.Refresh();
-            using (new FileStream(list, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-            {
-                model.Delete(model.Clips.Single());
-                Snapshots.Pump(1);
-            }
-            Check(model.Clips.Count == 1, "still in history, rather than gone now and back after the next backfill");
-        }),
-
         ("copying the previous item again after deleting it saves it", () =>
         {
             using var db = new Db();
@@ -814,13 +807,22 @@ static class Program
             Check(seen.SequenceEqual(new[] { "new.pdf" }), "reported: " + string.Join(",", seen));
         }),
 
-        ("an unreadable removed-files list pauses the backfill instead of bringing everything back", () =>
+        ("removals saved by 1.3.0 in forgotten.json move into the shared table once", () =>
         {
-            var list = Path.Combine(Paths.Dir, "forgotten.json");
-            File.WriteAllText(list, "{\"ClearedAt\":1}");
-            using (new FileStream(list, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                Check(Forgotten.Load() == null, "can't read it: no list rather than an empty one");
-            Check(Forgotten.Load()?.ClearedAt == 1, "read again once it's free");
+            var removed = Path.Combine(Paths.Dir, "Screenshot old.png");
+            var beforeClear = Path.Combine(Paths.Dir, "before.pdf");
+            var afterClear = Path.Combine(Paths.Dir, "after.pdf");
+            var clearedAt = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeMilliseconds();
+            var json = Path.Combine(Paths.Dir, "forgotten.json");
+            File.WriteAllText(json, new JavaScriptSerializer().Serialize(new { ClearedAt = clearedAt, Files = new Dictionary<string, long> { [removed] = clearedAt + 1000 } }));
+            using var db = new Db();
+            var listed = new[] { (beforeClear, DateTime.Now.AddHours(-2)), (afterClear, DateTime.Now) };
+            db.ImportLegacyForgotten(() => listed);
+            var hashes = Sql.Query(Paths.Db, "SELECT hash FROM forgotten ORDER BY hash");
+            var expected = new[] { removed, beforeClear }.Select(f => "f:" + Store.Sha(f)).OrderBy(h => h, StringComparer.Ordinal).ToList();
+            Check(hashes.SequenceEqual(expected), "the listed file and the one from before Clear all: " + hashes.Count);
+            Check(!File.Exists(json), "the old file is gone, so this happens once");
+            db.ImportLegacyForgotten(() => throw new Exception("not asked again"));
         }),
 
         ("a screen recording still being saved doesn't hold up a copied picture", () =>
@@ -847,6 +849,73 @@ static class Program
             var missing = Shell.IconImage(Path.Combine(Paths.Dir, "no such folder", "x.pdf"), 64);
             Snapshots.Pump(1);
             Check(missing.Visibility == Visibility.Collapsed, "no icon: collapsed");
+        }),
+
+        ("search treats % and _ as plain characters", () =>
+        {
+            using var db = new Db();
+            db.Upsert(ClipKind.Text, "50% off", null, "Notepad", "t:pct");
+            db.Upsert(ClipKind.Text, "500 apples", null, "Notepad", "t:500");
+            db.Upsert(ClipKind.Text, "my_file.txt", null, "Notepad", "t:under");
+            db.Upsert(ClipKind.Text, "myXfile.txt", null, "Notepad", "t:x");
+            db.Upsert(ClipKind.Text, @"C:\temp", null, "Notepad", "t:slash");
+            Check(db.Clips(query: "50%").Select(c => c.Text).SequenceEqual(new[] { "50% off" }), "% is a percent sign");
+            Check(db.Clips(query: "my_file").Select(c => c.Text).SequenceEqual(new[] { "my_file.txt" }), "_ is an underscore");
+            Check(db.Clips(query: @"C:\t").Select(c => c.Text).SequenceEqual(new[] { @"C:\temp" }), "a backslash is a backslash");
+        }),
+
+        ("a copy over 2 MB isn't saved; long ones show and send only their start", () =>
+        {
+            using var db = new Db();
+            var r = new Recorder(db);
+            var huge = new string('x', Recorder.MaxTextBytes + 1);
+            Check(!r.Record(Text(huge), "Notepad", DateTime.Now), "over 2 MB: skipped");
+            var lines = string.Concat(Enumerable.Range(0, 30_000).Select(i => "line " + i + "\n"));
+            Check(r.Record(Text(lines), "Notepad", DateTime.Now.AddSeconds(5)), "under 2 MB: saved");
+            var clip = db.Clips().Single();
+            var row = new Row(clip, 0, isSelected: false, new Model());
+            var texts = Descendants(row).OfType<System.Windows.Controls.TextBlock>().Select(t => t.Text).ToList();
+            Check(texts.Contains("line 0") && texts.Any(t => t.EndsWith("+ lines")), "the row reads only the start: " + string.Join(" | ", texts));
+            var preview = new PreviewPane(clip);
+            var shown = Descendants(preview).OfType<System.Windows.Controls.TextBox>().Single().Text;
+            Check(shown.Length < 100_100 && shown.EndsWith("but it pastes in full"), $"the preview shows the start ({shown.Length} characters)");
+            var got = (string)((Dictionary<string, object>)((System.Collections.IList)ClipBubble.Mcp.Call(db, "clipboard_get", new Dictionary<string, object?> { ["id"] = clip.Id })["content"])[0])["text"];
+            Check(got.Length < 200_200 && got.EndsWith($"(cut: {lines.Length} characters in all)"), $"clipboard_get sends the start ({got.Length} characters)");
+        }),
+
+        ("a failed mascot import leaves nothing behind", () =>
+        {
+            string Err(Action a) { try { a(); return ""; } catch (MascotException e) { return e.Message; } }
+            var missing = Path.Combine(Paths.Dir, "nowhere.png");
+            Check(Err(() => Mascots.Add("Half", "image", null, new() { ["idle"] = Svg, ["hover"] = missing })) == $"couldn't read the hover image at {missing}", "says which image");
+            Check(!Directory.EnumerateFiles(Mascots.Dir, "half*").Any(), "the idle SVG it already saved is gone too");
+        }),
+
+        ("screen readers see the bubble as a ClipBubble button they can press", () =>
+        {
+            var bubble = new BubbleView(new Model());
+            var pressed = 0;
+            bubble.Pressed = () => pressed++;
+            var peer = System.Windows.Automation.Peers.UIElementAutomationPeer.CreatePeerForElement(bubble);
+            Check(peer.GetName() == "ClipBubble" && peer.GetAutomationControlType() == System.Windows.Automation.Peers.AutomationControlType.Button, $"{peer.GetName()} / {peer.GetAutomationControlType()}");
+            Check(peer.GetHelpText() == "Opens your clipboard history", "help text");
+            ((System.Windows.Automation.Provider.IInvokeProvider)peer.GetPattern(System.Windows.Automation.Peers.PatternInterface.Invoke)).Invoke();
+            Check(pressed == 1, "pressing it does what a click does");
+        }),
+
+        ("a screenshot folder that's renamed and made again is watched again", () =>
+        {
+            var folder = Path.Combine(Paths.Dir, "renamed-" + Guid.NewGuid().ToString("N").Substring(0, 6));
+            Directory.CreateDirectory(folder);
+            var seen = new List<string>();
+            using var watcher = new FolderWatcher(folder, null, _ => true, (path, _) => seen.Add(Path.GetFileName(path)));
+            Directory.Move(folder, folder + "-old");
+            Directory.CreateDirectory(folder);
+            Thread.Sleep(50);
+            Snapshots.Pump(6);   // checked every 5 s
+            File.WriteAllText(Path.Combine(folder, "new.png"), "x");
+            Snapshots.Pump(1);
+            Check(seen.SequenceEqual(new[] { "new.png" }), "reported: " + string.Join(",", seen));
         }),
 
         ("MCP over stdio from the real exe: tools, history, image, mascots", Mcp),
@@ -883,6 +952,12 @@ static class Program
             stdin.WriteLine("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
             stdin.WriteLine("[1,2]");
             stdin.WriteLine("\"not an object\"");
+            stdin.WriteLine("   ");
+            for (var i = 0; i < 2; i++)
+            {
+                var reply = json.Deserialize<Dictionary<string, object>>(p.StandardOutput.ReadLine() ?? throw new Exception("server closed"));
+                Check(reply.ContainsKey("id") && reply["id"] == null && (int)((Dictionary<string, object>)reply["error"])["code"] == -32700, "parse error for a line that isn't a JSON object");
+            }
             var init = Call("initialize", new { protocolVersion = "2025-06-18" });
             Check((string)((Dictionary<string, object>)init["serverInfo"])["name"] == "clipbubble", "server name");
             var tools = List(Call("tools/list")["tools"]).Select(t => (string)((Dictionary<string, object>)t)["name"]).ToArray();

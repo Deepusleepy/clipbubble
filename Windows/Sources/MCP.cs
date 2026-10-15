@@ -98,7 +98,11 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
         {
             Dictionary<string, object?>? msg;
             try { msg = Store.Json.Deserialize<Dictionary<string, object?>>(line); }
-            catch (Exception e) when (e is ArgumentException or InvalidOperationException) { continue; }   // not a JSON object
+            catch (Exception e) when (e is ArgumentException or InvalidOperationException)   // not a JSON object
+            {
+                if (line.Trim().Length > 0) Send(output, Obj(("jsonrpc", "2.0"), ("id", null!), ("error", Obj(("code", -32700), ("message", "Parse error")))));
+                continue;
+            }
             if (msg == null || !msg.TryGetValue("id", out var id) || id == null) continue;   // notifications need no reply
             // One failing request (a locked database, a clipboard another app won't let go of) never stops the server.
             try { Handle(db, output, id, msg); }
@@ -168,7 +172,11 @@ Then check it works by calling clipboard_history with limit 3 (restart or reload
             {
                 Prefs.Reload();
                 if (Int(a.GetValueOrDefault("id")) is not { } id || db.Clip(id) is not { } c) return Text("No item with that id.", error: true);
-                var content = new List<object> { Obj(("type", "text"), ("text", Header(c) + "\n" + (c.Kind == ClipKind.Image ? c.File ?? "" : c.Text))) };
+                // Very long text is cut so one item can't flood the agent's context.
+                const int limit = 200_000;
+                var body = c.Kind == ClipKind.Image ? c.File ?? ""
+                    : c.Text.Length > limit ? c.Text.Substring(0, limit) + $"\n… (cut: {c.Text.Length} characters in all)" : c.Text;
+                var content = new List<object> { Obj(("type", "text"), ("text", Header(c) + "\n" + body)) };
                 if (c.ImagePath is { } p && ImageBase64(p) is { } b64) content.Add(Obj(("type", "image"), ("data", b64), ("mimeType", "image/png")));
                 return Obj(("content", content));
             }

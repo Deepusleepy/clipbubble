@@ -10,6 +10,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -128,7 +130,6 @@ sealed class Model
     public bool DeletesWaiting => deleting.Count > 0 || clearing;
 
     /// Gone from the list at once; the reload after the write shows what's really stored (the clip again, if the delete failed).
-    /// A removed screenshot or download is remembered first, so a failure there can't let the backfill bring it back.
     public void Delete(Clip c)
     {
         var i = Math.Max(0, Clips.FindIndex(x => x.Id == c.Id));
@@ -137,7 +138,7 @@ sealed class Model
         if (Selection == c.Id) selection = Clips.Count == 0 ? null : Clips[Math.Min(i, Clips.Count - 1)].Id;
         Raise(Change.Clips);
         if (Recent.RemoveAll(x => x.Id == c.Id) > 0) Raise(Change.Recent);
-        Writer.Write(db => { Forgotten.Remove(c); db.Delete(c.Id); }, failed =>
+        Writer.Write(db => db.Delete(c.Id), failed =>
         {
             deleting.Remove(c.Id);
             Refresh();
@@ -148,7 +149,7 @@ sealed class Model
     public void ClearAll()
     {
         clearing = true;
-        Writer.Write(db => { Forgotten.ClearAll(); db.DeleteAll(); }, failed =>
+        Writer.Write(db => db.DeleteAll(), failed =>
         {
             clearing = false;
             Refresh();
@@ -836,6 +837,22 @@ sealed class BubbleView : Grid
     readonly TextBlock badgeText;
     MascotView mascot;
     public readonly Ellipse HitArea;
+    /// What a click does; screen readers press the bubble through this too.
+    public Action Pressed = () => { };
+
+    /// One button for screen readers like Narrator: "ClipBubble", which opens the history.
+    protected override AutomationPeer OnCreateAutomationPeer() => new BubblePeer(this);
+
+    sealed class BubblePeer(BubbleView bubble) : FrameworkElementAutomationPeer(bubble), IInvokeProvider
+    {
+        protected override AutomationControlType GetAutomationControlTypeCore() => AutomationControlType.Button;
+        protected override string GetClassNameCore() => nameof(BubbleView);
+        protected override string GetNameCore() => "ClipBubble";
+        protected override string GetHelpTextCore() => "Opens your clipboard history";
+        protected override List<AutomationPeer>? GetChildrenCore() => null;
+        public override object? GetPattern(PatternInterface pattern) => pattern == PatternInterface.Invoke ? this : base.GetPattern(pattern);
+        public void Invoke() => bubble.Pressed();
+    }
 
     public BubbleView(Model model)
     {
@@ -1045,7 +1062,10 @@ sealed class Row : Border
         return image;
     }
 
-    string FirstLine => clip.Text.Split('\n', '\r').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim() ?? "";
+    /// Only the start of the text matters for a row, so long copies don't slow the list.
+    string Head => clip.Text.Length > 20_000 ? clip.Text.Substring(0, 20_000) : clip.Text;
+
+    string FirstLine => Head.Split('\n', '\r').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim() ?? "";
 
     string Title()
     {
@@ -1068,8 +1088,9 @@ sealed class Row : Border
         if (clip.Kind == ClipKind.File && clip.Paths.FirstOrDefault() is { } p) parts.Add(UI.Tilde(Path.GetDirectoryName(p) ?? ""));
         else if (clip.Kind == ClipKind.Text)
         {
-            var lines = clip.Text.Split('\n').Count(l => l.Trim('\r').Length > 0);
-            if (lines > 1) parts.Add($"{lines} lines");
+            var head = Head;
+            var lines = head.Split('\n').Count(l => l.Trim('\r').Length > 0);
+            if (lines > 1) parts.Add(clip.Text.Length > head.Length ? $"{lines}+ lines" : $"{lines} lines");
         }
         return string.Join(" · ", parts);
     }
@@ -1344,6 +1365,10 @@ sealed class PanelView : Grid
 /// Ctrl+Y: the selected item at full size.
 sealed class PreviewPane : Border
 {
+    /// Laying out megabytes of text would freeze the panel; the full text still pastes.
+    static string Shown(string text) =>
+        text.Length > 100_000 ? text.Substring(0, 100_000) + "\n\n… the rest is too long to preview, but it pastes in full" : text;
+
     public PreviewPane(Clip clip)
     {
         Background = new SolidColorBrush(Color.FromRgb(0x0F, 0x0E, 0x0D));
@@ -1368,7 +1393,7 @@ sealed class PreviewPane : Border
                 VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
                 Content = new TextBox
                 {
-                    Text = clip.Text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent, Foreground = UI.Primary,
+                    Text = Shown(clip.Text), IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent, Foreground = UI.Primary,
                     FontFamily = new FontFamily("Cascadia Mono, Consolas"), FontSize = 12, TextWrapping = TextWrapping.Wrap, Padding = new Thickness(14),
                 },
             };
@@ -1821,6 +1846,7 @@ sealed class App : Application
         face.HitArea.MouseLeftButtonDown += BubbleDown;
         face.HitArea.MouseMove += BubbleDrag;
         face.HitArea.MouseLeftButtonUp += BubbleUp;
+        face.Pressed = Toggle;
         bubble.Show();
         Snap(animated: false);
 
@@ -2001,9 +2027,11 @@ sealed class App : Application
     /// so it also reruns later.
     void ImportFolders()
     {
+        var watched = new[] { screenshots, downloads }.Where(w => w != null).ToList();
+        model.Writer.Write(db => db.ImportLegacyForgotten(() => watched.SelectMany(w => w!.Existing(7))));
         foreach (var (watcher, source) in new[] { (screenshots, "Screenshot"), (downloads, "Downloads") })
             if (watcher != null)
-                capture.AddFiles(source, () => Forgotten.Load() is { } gone ? watcher.Existing(7).Where(f => !gone.Has(f.Path, f.Added)) : [], model.Refresh);
+                capture.AddFiles(source, () => watcher.Existing(7), model.Refresh);
     }
 
     // MARK: Picking
@@ -2158,7 +2186,7 @@ sealed class App : Application
         pressed = false;
         RefreshMood();
         if (moved) { dragging = false; Snap(animated: true); }
-        else Toggle();
+        else face.Pressed();
     }
 
     void SetBubbleHover(bool on)
